@@ -13,14 +13,16 @@
 - agent-desktop 通过运行主机的本地可访问性接口操作桌面；云端安装本身不等于能控制 Windows，须单独接通目标机的交互桌面执行端。
 
 ## 批准边界
-已批准：保存需求及接续资料、建立当前项目的管理底座。
-未批准及未执行：目标机软件安装、远控服务及常驻连接、凭据配置、税务登录、任何真实库存写入、GitHub 建仓或 push。
+已批准：保存需求及接续资料、建立当前项目的管理底座；用户已口头批准安装所需软件并建立 VPS→本地连接（2026-11-06），但具体每步安装仍逐项确认后执行。
+未批准及未执行：目标机凭据配置、税务登录、任何真实库存写入、GitHub 建仓或 push。
 用户到目标机并连接 VPS 不自动扩大授权；先说明必要本人步骤及最小接入范围。
 
 ## 当前事实与证据
 用户在本次对话直接提供软件、路径、网站和目标电脑关系；上述为用户提供信息，不是现场验证。
-现场确认（2026-11-06 用户在新机器跑检查命令）：目标机为 Windows Server 2022 Standard 64 位；C:\scan 存在、内有 2 个 PDF；未安装 node/npm/agent-desktop/ssh（Get-Command 全空）。Windows Server 的交互桌面（RDP 会话 vs SSH Session 0）是 agent-desktop 接入前必须核实的关键点——SSH 登录成功不等于能读到交互桌面。
-当前工作目录为 /home/hermes/projects/TJ-AI-Ops，初始化前为空且不在 Git 仓库内。
+现场确认（2026-11-06）：目标机 Windows Server 2022 Standard 64 位；C:\scan 存在、内有 2 个 PDF。首次 Get-Command 检查显示 node/npm/agent-desktop/ssh 全空，后经完整检查证实是 PATH 未加载——实际均已装好：node v26.13.0 / npm 11.20.0 / agent-desktop 1.2.0（C:\Program Files\nodejs 与 AppData\Roaming\npm）。ssh 仍未装。
+agent-desktop 已本地验证可运行：accessibility 权限 granted；list-apps 看到 irsPOS.exe（pid 10540）前台运行，另有 Link_to_SQL.exe（疑似 POS 的 SQL 后端，暂只记录、不直接查库）。
+Windows Server 交互桌面（console 会话 vs SSH Session 0）仍是远程接入前必须核实的关键点——SSH 登录成功不等于能读到交互桌面。
+当前工作目录为 /home/hermes/projects/TJ-AI-Ops。
 尚未读取任何 PDF，未访问登录后的税务数据，未看过 IRS POS 界面；未创建或验收可执行业务 skill。
 Vercel 官方项目参考：https://github.com/vercel-labs/agent-desktop 。已读取官方 README 确认 Windows UI Automation 与本机运行架构；安装与跨机连接尚未测试。
 
