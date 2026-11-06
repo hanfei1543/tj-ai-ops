@@ -32,11 +32,16 @@
 - txtCompany：公司名（只读，随 code 自动带出）
 - txtInvoiceNo：发票号（可写）
 - gbReceiveInformation 收货信息组：ceSelfBill(Self-Billed 勾选)、meRemark(备注 memo)
-- gridcInvoiceDTL：明细表（table，18 列待展开；F7 sbBarcode 条码录入、sbMoveNext/Prev 翻记录）
+- gridcInvoiceDTL：明细表（table，18 列；F7 sbBarcode 条码录入、sbMoveNext/Prev 翻记录）
 - txtBarcode：条码录入（F7）
 - beDiscount：折扣(0.00)；txtPurchaseTax：进项税(只读 0.00)；txtSubTotal：小计(只读)；txtRounding：舍入(只读)
 - cbViewPO：View PO 按钮；sbMoreInformation：More Info；ceTotalRounding：Activate Total Rounding 勾选
 - PanelControl2（右侧）：Navigator 组 = Print Barcode / Import-Text / Import-Excel / Validate e-Invoice + View Grid Option
+
+### 明细表 gridcInvoiceDTL 的 18 列（左→右）
+No · Item No. · Description · Qty · UOM · Price · Discount · G/R Price · G/R Price(EX) · Amount · Base Cost · New Base Cost · Remark · PO · Min. Price · Amt(Tax) · Taxable Amt · eInv Tax Class
+- 关键列：Price（单价）、Qty、UOM、Item No.、Description、Discount、eInv Tax Class（e-Invoice 税类）
+- 「缺价」＝Price／成本列空，须从 MyInvois e-Invoice 查单价回填。
 
 ### Home 顶栏快捷键（Lower Ribbon）
 - Ctrl+I Item · Ctrl+U Customer Master · Ctrl+F2 · F1 Clear · F8 Save · F12 Delete(禁用) · F4 Exit · Re-Order(BASIC) · Ctrl+F10 Subtotal · Print/Preview · Ctrl+L · F9 · Ctrl+Z · F3 Report · Ctrl+O Log Off
