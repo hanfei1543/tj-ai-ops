@@ -50,5 +50,32 @@ No · Item No. · Description · Qty · UOM · Price · Discount · G/R Price ·
 - 入货录入流程：选供应商(txtCode→txtCompany 自动带出) → 填发票号(txtInvoiceNo) → 明细表加货品(gridcInvoiceDTL，条码 txtBarcode 或逐行) → 折扣/税/舍入 → 保存(F8)。
 - 「缺价」：DO 只有货品+数量无价，需查 MyInvois e-Invoice 单价后填入明细表成本列（列名待确认）。
 
+## Item Master frmItemMaster 字段映射（2026-11-06 实测）
+
+### SOP 九字段 ↔ 界面字段（General tab）
+| SOP 字段 | 界面标签 | automation_id | 输入框 aid |
+|---|---|---|---|
+| Item Code | Item No. | txtCode | 55970740 |
+| Unit Cost | Unit Cost | txtUnitCost | 27921008 |
+| Min. Price | Min. Price | txtMinPrice | 8783720 |
+| Color Code | Colour | beColour | 1313010 |
+| List Price | LIST PRICE | txtPrice1 | 789874 |
+| SP1 | SP 1 | txtPrice2 | 855398 |
+| SP2 | SP 2 | txtPrice3 | 13043354 |
+| SP3 | SP 3 | txtPrice4 | 2493428 |
+| INV Price 1 | INV PRICE 1 | txtPrice5 | 16189612 |
+| INV Price 2 | INV PRICE 2 | txtPrice6 | 32246844 |
+
+### 售价字段视觉顺序（上→下）
+LIST PRICE(txtPrice1) → SP1(txtPrice2) → SP2(txtPrice3) → SP3(txtPrice4) → INV PRICE1(txtPrice5) → INV PRICE2(txtPrice6) → Min.Price(txtMinPrice)
+注意：UIA tree 里这些字段按倒序出现（txtMinPrice→txtPrice6→…→txtPrice1），程序按 automation_id 定位、不依赖顺序。
+
+### 其他关键字段
+- 货品编号 Item No. = txtCode（F7 btnCodeList 打开列表）；描述 txtDescription1/2；尺寸 txtSize
+- Item Type cboItemType（STOCK ITEM）；Discontinue ceDiscontinue；保修 seWarrantyDays
+- 导航 btnMoveFirst/Previous/Next/Last
+- XtraTabControl1 有 15 个 tab（General/UOM/Sales Volume/Vendor/…/e-Invoice）
+
 ## 变更记录
 - 2026-11-06 skeleton snapshot 确认顶层结构；full snapshot 确认收货单字段映射。
+- 2026-11-06 实测 Item Master 字段映射（九字段 + Item No. 的 automation_id）。
