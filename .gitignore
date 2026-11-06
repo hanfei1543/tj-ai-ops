@@ -1,0 +1,20 @@
+# Sensitive business inputs and runtime artifacts
+.env
+.env.*
+!.env.example
+*.pdf
+*.PDF
+*.png
+*.jpg
+*.jpeg
+*.zip
+*.db
+*.sqlite*
+__pycache__/
+inputs/
+private/
+runtime/
+artifacts/
+logs/
+credentials/
+*.lock
