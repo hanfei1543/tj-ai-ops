@@ -45,6 +45,7 @@ Vercel 官方项目参考：https://github.com/vercel-labs/agent-desktop 。已�
 - AGENTS.md
 - docs/SOT.md
 - docs/irs-pos-ui.md（IRS POS 界面地图，逐步补全）
+- docs/Goods-Receive-SOP.md（业务规则 SOP：GOLD HARVEST 编码 + 九字段变价规则）
 - /home/hermes/project-memory/TJ-AI-Ops/MEMORY.md
 - /home/hermes/project-memory/TJ-AI-Ops/stock-workflow.md
 - https://github.com/vercel-labs/agent-desktop

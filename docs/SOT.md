@@ -10,7 +10,10 @@
 - 授权已变更：用户已口头批准「需要什么装什么 + 建立 VPS→本地连接」，具体每步安装仍逐项确认。
 - agent-desktop 界面字段映射完成（详见 docs/irs-pos-ui.md）：收货单 frmGoodsReceive 表头字段 + 明细表 18 列。
 - 反向隧道已通并验证：VPS→Windows 桥接（scripts/tunnel/bridge.js + start.bat，端口 9000）可用，VPS 可远程驱动 agent-desktop（list-apps 实测可见 irsPOS.exe）。
-- 下一步：读用户提供的「进货处理」文档（业务流程／字段口径／缺价处理），据此设计 PDF→POS 录入自动化；C:\scan 的 2 个 DO 样本待读。
+- 桥 v2 已部署（增 read/list 端点），可远程读目标机文件；SOP 已读取并存档 docs/Goods-Receive-SOP.md。
+- SOP 核心规则：DO 有价直用、无价查 MyTax/MyInvois；排除 Pulang(退)/Rosak(坏)；GOLD HARVEST 成本码(G=1..E=9，T/S/Y/X=100/10/1/0.1)；仅新价>原底价才更新 Item Master 九字段(Unit Cost/Min. Price/Color Code/六售价)，涨幅×1.1 进位 RM0.10 加到六售价。
+- 待确认：MyTax vs MyInvois 哪个查价；GOLD HARVEST 零位/超百位写法需真实 Color Code 样本；Item Master 九字段界面映射。
+- 下一步：读 C:\scan 的 2 个 DO PDF 样本，提取货品/手写 Item Code/数量；核对 Item Master 界面字段。
 - 已排除/勿重试：不把当前电脑当目标机；不把登录 VPS 当成桌面已接通；不操作真实库存、不自动登录税务、不启动旧 worker；SSH 连进 Windows 不当作已能读到交互桌面。
 
 ## 2 交接上下文
