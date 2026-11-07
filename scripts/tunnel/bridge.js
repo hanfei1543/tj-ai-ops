@@ -4,7 +4,7 @@
 //   {"args":["snapshot","--app","irsPOS.exe","-i"]}  -> 执行 agent-desktop，回传 JSON
 //   {"read":"C:\\path\\file.txt"}                      -> 读文件，回传 base64
 //   {"list":"C:\\path"}                                -> 列目录
-//   {"write":{"path":"C:\\...\\x.xlsx","b64":"..."}}   -> 写文件（仅白名单目录）
+//   {"write":{"path":"C:\\...\\x.xlsx","b64":"..."}}   -> 写文件（仅白名单目录，先 .part 再原子改名）
 const http = require('http');
 const { exec } = require('child_process');
 const fs = require('fs');
@@ -15,8 +15,9 @@ const LOG = 'C:\\irs\\bridge.log';
 const AD = (process.env.APPDATA || 'C:\\Users\\Administrator\\AppData\\Roaming') + '\\npm\\agent-desktop.cmd';
 
 // write 白名单：只允许写到这些目录（目录本身或其子目录）。
+// Hermes 只写 Pending；Processing/Done/Failed 由本机 Queue Runner 管理，Hermes 不碰。
 const WRITE_ALLOW = [
-  'C:\\Users\\Administrator\\Desktop\\operation\\PO-Auto-Generate',
+  'C:\\Users\\Administrator\\Desktop\\operation\\PO_Queue\\Pending',
 ];
 const MAX_WRITE_BYTES = 20 * 1024 * 1024; // 20MB 上限
 
@@ -56,7 +57,9 @@ http.createServer(function (req, res) {
         var wbuf = Buffer.from(wb64, 'base64');
         if (wbuf.length > MAX_WRITE_BYTES) { reply(res, { ok: false, error: 'file too large' }); return; }
         fs.mkdirSync(path.dirname(wp), { recursive: true });
-        fs.writeFileSync(wp, wbuf);
+        var wtmp = wp + '.part';
+        fs.writeFileSync(wtmp, wbuf);
+        fs.renameSync(wtmp, wp); // 原子改名，避免 Queue Runner/PAD 读到未写完的文件
         log('WRITE ' + wp + ' ' + wbuf.length + 'B');
         reply(res, { ok: true, size: wbuf.length, path: wp });
       } catch (e) { reply(res, { ok: false, error: String(e) }); }
@@ -96,6 +99,6 @@ http.createServer(function (req, res) {
     reply(res, { ok: false, error: 'unknown command' });
   });
 }).listen(PORT, '127.0.0.1', function () {
-  console.log('irs bridge v3 on 127.0.0.1:' + PORT);
-  log('STARTED v3');
+  console.log('irs bridge v3.1 on 127.0.0.1:' + PORT);
+  log('STARTED v3.1');
 });
