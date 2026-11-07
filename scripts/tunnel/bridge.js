@@ -1,8 +1,10 @@
-// IRS POS agent-desktop 桥 v2：监听 127.0.0.1:9000。
-// 支持三种 POST：
+// IRS POS agent-desktop 桥 v3：监听 127.0.0.1:9000。
+// 相比 v2 新增 write：把 base64 内容写到白名单目录（供 VPS 推送 Excel 给 PAD）。
+// 支持四种 POST：
 //   {"args":["snapshot","--app","irsPOS.exe","-i"]}  -> 执行 agent-desktop，回传 JSON
 //   {"read":"C:\\path\\file.txt"}                      -> 读文件，回传 base64
 //   {"list":"C:\\path"}                                -> 列目录
+//   {"write":{"path":"C:\\...\\x.xlsx","b64":"..."}}   -> 写文件（仅白名单目录）
 const http = require('http');
 const { exec } = require('child_process');
 const fs = require('fs');
@@ -11,6 +13,21 @@ const path = require('path');
 const PORT = 9000;
 const LOG = 'C:\\irs\\bridge.log';
 const AD = (process.env.APPDATA || 'C:\\Users\\Administrator\\AppData\\Roaming') + '\\npm\\agent-desktop.cmd';
+
+// write 白名单：只允许写到这些目录（目录本身或其子目录）。
+const WRITE_ALLOW = [
+  'C:\\Users\\Administrator\\Desktop\\operation\\PO-Auto-Generate',
+];
+const MAX_WRITE_BYTES = 20 * 1024 * 1024; // 20MB 上限
+
+function inAllow(target) {
+  const t = path.resolve(target).toLowerCase();
+  for (const d of WRITE_ALLOW) {
+    const base = path.resolve(d).toLowerCase();
+    if (t === base || t.startsWith(base + '\\')) return true;
+  }
+  return false;
+}
 
 function log(m) { try { fs.appendFileSync(LOG, new Date().toISOString() + ' ' + m + '\n'); } catch (e) {} }
 
@@ -26,6 +43,25 @@ http.createServer(function (req, res) {
   req.on('end', function () {
     var cmd;
     try { cmd = JSON.parse(body); } catch (e) { reply(res, { ok: false, error: 'bad json' }); return; }
+
+    if (cmd.write && cmd.write.path) {
+      var wp = cmd.write.path;
+      var wb64 = cmd.write.b64 || '';
+      if (!inAllow(wp)) {
+        log('WRITE DENY ' + wp);
+        reply(res, { ok: false, error: 'path not in whitelist' });
+        return;
+      }
+      try {
+        var wbuf = Buffer.from(wb64, 'base64');
+        if (wbuf.length > MAX_WRITE_BYTES) { reply(res, { ok: false, error: 'file too large' }); return; }
+        fs.mkdirSync(path.dirname(wp), { recursive: true });
+        fs.writeFileSync(wp, wbuf);
+        log('WRITE ' + wp + ' ' + wbuf.length + 'B');
+        reply(res, { ok: true, size: wbuf.length, path: wp });
+      } catch (e) { reply(res, { ok: false, error: String(e) }); }
+      return;
+    }
 
     if (cmd.read) {
       try {
@@ -60,6 +96,6 @@ http.createServer(function (req, res) {
     reply(res, { ok: false, error: 'unknown command' });
   });
 }).listen(PORT, '127.0.0.1', function () {
-  console.log('irs bridge v2 on 127.0.0.1:' + PORT);
-  log('STARTED v2');
+  console.log('irs bridge v3 on 127.0.0.1:' + PORT);
+  log('STARTED v3');
 });
