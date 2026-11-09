@@ -19,7 +19,7 @@ VPS 指挥目标 Windows 上的 Vercel agent-desktop，读取 C:\scan 单据、�
 ## 当前事实与证据
 - 目标 Windows Server 2022 x64，node/npm/agent-desktop 已存在且能运行；OpenSSH 客户端可用（scp 成功）。最初 Get-Command 空白不能证明没安装，PATH 原因未独立证实。
 - Windows 的 C:\irs\start.bat 启动 bridge.js 与反向 SSH，VPS 127.0.0.1:9000 到目标机 localhost:9000；本轮远程 version/list-apps/snapshot/read/list 成功。会话关闭后连接是否仍存活必须重新测试，不能当常驻服务。
-- VPS 客户端：/home/hermes/.hermes/scripts/irs.py。桥源码 scripts/tunnel/bridge.js（v2，args/read/list），Windows 开机入口尚未改成一键联合启动。
+- VPS 客户端：/home/hermes/.hermes/scripts/irs.py。桥源码 scripts/tunnel/bridge.js（v2，args/read/list）。用户在档三后要求联合启动，候选已生成 scripts/tunnel/TJ-AI-Ops.bat（嵌入 ensure-connection.ps1），校验编码往返与 cmd 行长通过；尚未下载部署到 Windows、未实跑，不能称已合并。启动器复用现存桥/SSH 进程，检查本机 version；启动新隧道启用 ExitOnForwardFailure/密钥认证/既有 host 校验，隧道端到端仍需 VPS 读取验证。
 - 目标启动器 C:\Users\Administrator\Desktop\operation\TJ-AI-Ops.bat 用 hermes-xeon 密钥登录 VPS；希望同时启动 C:\irs\start.bat，但尚未实施。SOP 原文同目录 Goods_Receive_AI_SOP_V1.txt；已读存 docs/Goods-Receive-SOP.md。
 - C:\scan 本轮列到四个 PDF：20261106162415.pdf、20261106162513.pdf、20261106194641.pdf、20261106200436.pdf。后者四页合扫。扫描无文字层，视觉提取只为候选；不能声称所有货号已核对。
 - 本轮选择单：ING HAN D-021660 门锁 30 SET，印刷价 18.00；FORTUNE I-107612 木门 10 PCS 印刷价 62.00、钻孔 5 PCS 印刷价 2.00。进入前还需价格口径、重复单查询和单位核对，不能直接保存。
