@@ -1,8 +1,17 @@
-# TJ-AI-Ops — 入货自动化
+# TJ-AI-Ops — TJ 五金店自动化（PO 采购单 + IRS 入货）
 
 ## 项目记忆入口
 索引：/home/hermes/project-memory/TJ-AI-Ops/MEMORY.md。
 开工先读索引，按需展开单条。
+
+## 前端子项目（PO 采购单网页）
+
+- 独立 Vite app，位于本仓库 `web/`；状态真相源：`docs/tj-po-system.md`。
+- 复用 DYT 同一个 Supabase 实例（独立 `tj_*` 表，anon 读写），不买新 Supabase、不买新域名。
+- 部署目标：Cloudflare Pages 项目 `tj-ai-ops`（root directory = `web`），地址 tj-ai-ops.pages.dev/tj-po-system。
+- 改 PO 网页只在 `web/` 内改，不碰 DYT-TCM-SAAS 中医项目；两个项目各自独立部署。
+- 构建：`cd web && npm run build`；本地预览：`npm run preview`。
+- 环境变量：`web/.env.local`（VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY，gitignored）。
 
 ## 管理约定
 - 沿用 DYT-AI-Ops 的管理方式，不继承其业务配置、服务或凭据。
