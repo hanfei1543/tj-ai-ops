@@ -8,7 +8,8 @@
 
 - 独立 Vite app，位于本仓库 `web/`；状态真相源：`docs/tj-po-system.md`。
 - 复用 DYT 同一个 Supabase 实例（独立 `tj_*` 表，anon 读写），不买新 Supabase、不买新域名。
-- 部署目标：Cloudflare Pages 项目 `tj-ai-ops`（root directory = `web`），地址 tj-ai-ops.pages.dev/tj-po-system。
+- 部署目标：Cloudflare Pages 项目 `tj-ai-ops`（Git 集成 hanfei1543/tj-ai-ops，root directory = `web`，push main 自动部署），地址 tj-ai-ops.pages.dev/tj-po-system。
+- GitHub 远程：`https://github.com/hanfei1543/tj-ai-ops.git`（origin/main，代码备份 + 自动部署触发源）。
 - 改 PO 网页只在 `web/` 内改，不碰 DYT-TCM-SAAS 中医项目；两个项目各自独立部署。
 - 构建：`cd web && npm run build`；本地预览：`npm run preview`。
 - 环境变量：`web/.env.local`（VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY，gitignored）。

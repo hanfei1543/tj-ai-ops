@@ -12,3 +12,7 @@
 - 本轮用控件翻页选中 ING HAN 4000/I01；供应商弹窗 HWND 未被工具清单识别、主窗禁用，输入框语义赋值/键盘输入未通过实测。本机同样失败，未发送失败命令对应物理按键。
 - 用户亲测空 txt 没反应；空有效 xlsx 报 external table is not in the expected format。停在获取真实导入模板/导出数据样本，不再猜格式。
 - 交接更新批准范围、货号更正、ING HAN 以 DO 代发票号、MyInvois 匹配规则、GOLD HARVEST 的 Z 位值及安全债。联合启动器、Flash 对照、真实保存/查回、防重账本均未完成。大脑层已核对，本轮无配置/规则变更，不做双层归档。
+
+## 2026-11-09 22:13 — PO 采购单独立上线 + Git 集成自动部署
+
+- PO 采购单独立完成：新建 web/ Vite app（从 DYT-TCM-SAAS 拆出 /tj-po-system），build 通过；部署 tj-ai-ops.pages.dev（Supabase 读写验证 30654 商品/供应商可读）；建 GitHub 仓库 hanfei1543/tj-ai-ops + CF Git 集成（root_dir=web，push main 自动部署）；推送器 tj-po-push.mjs 迁入 scripts/，cron 包装路径已更新。中医站已删 PO 并重新部署。
