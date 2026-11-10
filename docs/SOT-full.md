@@ -16,3 +16,9 @@
 ## 2026-11-09 22:13 — PO 采购单独立上线 + Git 集成自动部署
 
 - PO 采购单独立完成：新建 web/ Vite app（从 DYT-TCM-SAAS 拆出 /tj-po-system），build 通过；部署 tj-ai-ops.pages.dev（Supabase 读写验证 30654 商品/供应商可读）；建 GitHub 仓库 hanfei1543/tj-ai-ops + CF Git 集成（root_dir=web，push main 自动部署）；推送器 tj-po-push.mjs 迁入 scripts/，cron 包装路径已更新。中医站已删 PO 并重新部署。
+
+## 2026-11-10 22:16 — PO 推送器依赖修复 + 隧道 Hidden 修复
+
+- 推送器依赖修复：tj-po-push.mjs 从 DYT-TCM-SAAS 迁到 TJ-AI-Ops 后 exceljs 未随迁，cron 每分钟报 ERR_MODULE_NOT_FOUND，PO-000011 卡 pending_push。已在 TJ-AI-Ops 根 npm install exceljs，手动 --once 推 PO-000011 成功；查回目标机 Pending 有 PO-000011.xlsx(6870B)、Supabase 状态 exported。
+- 跨仓库迁移脚本时 node 依赖必须在新仓库根重装，否则 cron no_agent 静默失败（教训已入 windows-tunnel-bridge skill）。
+- 隧道 Hidden 修复已部署验证：TJ-AI-Ops.bat 隧道 WindowStyle Minimized→Hidden + 参数改数组（修 PowerShell 引号 bug）+ StrictHostKeyChecking 改 accept-new。用户已替换并重启，VPS 侧 9000 监听在线、桥 version 返回正常。
