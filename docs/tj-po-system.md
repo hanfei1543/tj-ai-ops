@@ -34,7 +34,8 @@
 
 ## 3 未归档缓冲池
 
-- (空)
+- [PROGRESS] 2026-11-10 推送器依赖修复：tj-po-push.mjs 从 DYT-TCM-SAAS 迁到 TJ-AI-Ops 后 exceljs 未随迁，cron 每分钟报 ERR_MODULE_NOT_FOUND，PO-000011 卡 pending_push。已在 TJ-AI-Ops 根 npm install exceljs，手动 --once 推 PO-000011 成功；查回目标机 Pending 有 PO-000011.xlsx(6870B)、Supabase 状态 exported。
+- [MEM-CANDIDATE] 跨仓库迁移脚本时，脚本 import 的 node 依赖（exceljs）必须在新仓库根目录重装，否则 cron no_agent 静默失败（报错只在 cron last_error，stdout 空不投递）。
 
 ---
 

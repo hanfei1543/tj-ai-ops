@@ -1,0 +1,25 @@
+{
+  "name": "tj-ai-ops",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hanfei1543/tj-ai-ops.git"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/hanfei1543/tj-ai-ops/issues"
+  },
+  "homepage": "https://github.com/hanfei1543/tj-ai-ops#readme",
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}
