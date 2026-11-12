@@ -407,9 +407,13 @@ export default function CombinePoPage() {
               return (
                 <div
                   key={l.key}
-                  className={`flex rounded-xl border bg-white transition-colors ${
-                    dropIndex === idx && dragIndex !== idx ? 'border-emerald-400 ring-2 ring-emerald-100' : 'border-slate-200'
-                  } ${dragIndex === idx ? 'opacity-50' : ''}`}
+                  className={`relative flex rounded-xl border bg-white transition-all ${
+                    dragIndex === idx
+                      ? 'z-10 scale-[1.02] border-emerald-400 shadow-xl ring-2 ring-emerald-400'
+                      : dropIndex === idx && dragIndex !== idx
+                        ? 'border-emerald-400 ring-2 ring-emerald-100'
+                        : 'border-slate-200'
+                  }`}
                   onDragOver={(e) => {
                     e.preventDefault()
                     if (dragIndex !== null) setDropIndex(idx)

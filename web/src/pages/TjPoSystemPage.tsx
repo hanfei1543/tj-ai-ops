@@ -1024,9 +1024,13 @@ function LineRow({
 
   return (
     <div
-      className={`flex rounded-xl border bg-white transition-colors ${
-        dropTarget ? 'border-emerald-400 ring-2 ring-emerald-100' : 'border-slate-200'
-      } ${dragging ? 'opacity-50' : ''}`}
+      className={`relative flex rounded-xl border bg-white transition-all ${
+        dragging
+          ? 'z-10 scale-[1.02] border-emerald-400 shadow-xl ring-2 ring-emerald-400'
+          : dropTarget
+            ? 'border-emerald-400 ring-2 ring-emerald-100'
+            : 'border-slate-200'
+      }`}
       onDragOver={(e) => {
         e.preventDefault()
         onDragOver()
