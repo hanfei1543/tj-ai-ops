@@ -44,6 +44,7 @@ PO-000009 批准顺序：同一测试货号 00101，UNIT/2.50 订购 5、实收 
 ### Website 内部 Excel 测试与收货事件防重复（2026-11-12 追加）
 - 收货事件防重复入账已代码化：新增部分唯一索引 `uq_tj_po_headers_receipt_event_id`（`receipt_event_id` 非空时唯一）。public 版 `supabase/migrations/20261112_receipt_event_dedup.sql` 仅 PREPARED 未应用；tj_preview 版 `20261112_receipt_event_dedup_preview.sql` 已通过 Management API 应用并读回，DB 断言 `supabase/tests/20261112_receipt_event_dedup.sql` 通过（重复 receipt_event_id 被唯一索引拒绝、全新 ID 允许、NULL 多行不受限）。
 - Website 内部 Excel 用真实生成器（`scripts/gen_po_excel.mjs --mode formal --po-name/--gr-name`）产出两份文件：`/home/hermes/backups/TJ-AI-Ops/20261112-website-test/WEBSITE_PO_TEST.xlsx`（PO_Lines 8 列 + Website PO Date=2026-11-09，3 行）与 `WEBSITE_GR_TEST.xlsx`（GR_Info + GR_Lines，receipt_event_id / DO / 审批冻结 / 订购实收齐全，irs_po_no / irs_grn_no 空）。`scripts/verify_website_test.mjs` 逐项核对 15/15 通过；114 项测试 + tsc/vite 构建通过。未新增员工前台导出按钮，未推送、未部署。commit `ba5372d`。
+- PAD 复审发现 PO_Lines Qty 与 GR Ordered Qty 不一致（PO Qty=实收 accepted_qty=4，GR Ordered=订购 original_qty=5）。已修正：`buildPoLineRows` 的 Qty 口径改为 `original_qty ?? qty`（PO 是采购单，Qty 必须是订购数量，与 GR Ordered Qty 一致；实收只进 GR Accepted Qty）。`verify_website_test.mjs` 升级为逐行严格核对（Item Code/UOM/Description/Unit Price/PO Qty==GR Ordered Qty/Accepted Qty/source_line_ids 追溯，positional 对齐区分重复 Item Code），16/16 通过，115 项测试通过，重新生成两份文件。commit `85a7725`。
 
 ## 阻塞与避坑
 日期缺失的旧冻结样本只能内部审阅，不能冒充可供 PAD 正式导入的样本。IRS 编号必须有独立核对证据，不能因字段里有数字即导出。生产 anon 写权限较宽，数据库护栏未应用前不能声称真实生产端已实现数据库防绕过；本轮生产迁移须另行授权。先完成修正、隔离回归，再提交给用户决定是否上线核心功能；三个冻结继续保持。
