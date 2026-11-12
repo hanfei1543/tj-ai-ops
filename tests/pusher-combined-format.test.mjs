@@ -19,7 +19,7 @@ test('后台 Combined PAD 生成器保留原7列并追加业务日期，但 Push
   await w.xlsx.load(bytes)
   const s = w.getWorksheet('PO_Lines')
   assert.deepEqual(s.getRow(1).values.slice(1), ['Supplier Code', 'Supplier Name', 'Item Code', 'Description', 'UOM', 'Qty', 'Unit Price (RM)', 'Website PO Date'])
-  assert.deepEqual(s.getRow(2).values.slice(1), ['001', 'TEST', '00101', 'UNIT', 'UNIT', 4, 2.5, '2026-11-09'])
+  assert.deepEqual(s.getRow(2).values.slice(1), ['001', 'TEST', '00101', 'UNIT', 'UNIT', 5, 2.5, '2026-11-09'])
   assert.equal(s.getRow(3).getCell(5).value, 'BOX')
   await assert.rejects(p.pushOne(h), /冻结/)
   assert.equal(bridgeCalls, 0)

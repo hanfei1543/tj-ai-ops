@@ -155,9 +155,9 @@ test('缺日期：review 模式产出 INTERNAL NOT FOR PAD 样本，日期留空
   for (const r of po.rows.slice(1)) {
     assert.ok(r[7] === undefined || r[7] === null || r[7] === '', `日期列应为空，实际 ${JSON.stringify(r[7])}`)
   }
-  // Qty = accepted_qty ?? qty；长号码前导零保留
+  // Qty = original_qty ?? qty（订购数量）；长号码前导零保留
   assert.equal(po.rows[1][2], '0030000000003')
-  assert.equal(po.rows[1][5], 4)
+  assert.equal(po.rows[1][5], 5)
   assert.equal(po.rows[2][5], 3)
 
   // 全程只读

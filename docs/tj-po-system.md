@@ -83,7 +83,7 @@ Preview 数据库日期／防绕过／摘要版本迁移已单独应用；本轮
 
 - Worksheet 名 `PO_Lines`；普通单原 7 列 Supplier Code / Supplier Name / Item Code / Description / UOM / Qty / Unit Price (RM) 不变。Combined PO 在末尾追加 Website PO Date（yyyy-MM-dd 文本）；后台格式生成器也支持 8 列，但实际 Combined Push 仍禁止。
 - Item Code / Supplier Code = 文本（前导零安全）；Qty / Unit Price = 数值。
-- Qty 取 `accepted_qty ?? qty`（合并单导出实收/批准数量，普通单回退订购 qty）；行序按 `line_no`（= 拖曳排序后的最终批准顺序）。
+- Qty 取 `original_qty ?? qty`（PO 的「订购数量」；普通单回退 qty）。合并单的 PO_Lines Qty 必须与 GR_Lines 的 Ordered Qty 一致；实收数量 accepted_qty 只进 GR 的 Accepted Qty，不进 PO（2026-11-12 PAD 合约核对修正：此前误用 accepted_qty 导致 PO Qty=实收、GR Ordered=订购 不一致）。行序按 `line_no`（= 拖曳排序后的最终批准顺序）。
 - Add New Item Master 独立导出 Worksheet 名 `Item_Master`（Item Code / Barcode / Description / UOM / Category / Supplier Code / Purchase Cost / Selling Price / Tax Rate / SST Info）——IRS 实际必填字段尚未验收，此为过渡数据包。
 
 ### 新功能（2026-11-12）

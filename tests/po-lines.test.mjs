@@ -48,13 +48,23 @@ test('普通单行序 / code / uom / price 忠实保留，不排序不换算', (
   ])
   assert.deepEqual(out.rows.map((r) => r.uom), ['UNIT', 'UNIT', 'PCS'])
   assert.deepEqual(out.rows.map((r) => r.unit_price), [2.5, 1.25, 0.9])
-  assert.deepEqual(out.rows.map((r) => r.qty), [10, 4, 7])
+  // Qty = original_qty ?? qty：普通单无 original_qty，回退 qty（订购数量）
+  assert.deepEqual(out.rows.map((r) => r.qty), [10, 5, 7])
 })
 
-test('Qty = accepted_qty ?? qty：0 是有效实收值，不被回退成订购量', () => {
+test('Qty = original_qty ?? qty：合并单取订购数量，绝不用实收数量顶替', () => {
+  const out = buildPoLineRows(
+    { ...HEADER_COMBINED, website_po_date: '2026-11-12' },
+    [{ item_code: 'X1', description: 'D', uom: 'UNIT', qty: 4, original_qty: 5, accepted_qty: 4, unit_price: 1 }],
+    { mode: 'combined' },
+  )
+  assert.equal(out.rows[0].qty, 5, 'PO Qty 必须是订购数量（与 GR Ordered Qty 一致），不是实收 4')
+})
+
+test('original_qty = 0 是有效订购值，不被 ?? 回退成 qty', () => {
   const out = buildPoLineRows(
     HEADER_STD,
-    [{ item_code: 'X1', description: 'D', uom: null, qty: 9, unit_price: 1, accepted_qty: 0 }],
+    [{ item_code: 'X1', description: 'D', uom: null, qty: 9, original_qty: 0, unit_price: 1 }],
     { mode: 'standard' },
   )
   assert.equal(out.rows[0].qty, 0)

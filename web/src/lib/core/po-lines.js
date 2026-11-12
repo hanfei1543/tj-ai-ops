@@ -5,7 +5,11 @@
 //
 // 冻结口径（来自业务验收，不要"优化"）：
 //   * 行序 = 传入 lines 的顺序（拖曳/审批后的 line_no 顺序），不排序、不合并。
-//   * Qty = accepted_qty ?? qty（合并单取批准/实收数量；普通单回退订购数量）。
+//   * Qty = original_qty ?? qty（PO 的「订购数量」；普通单回退 qty）。
+//     合并单的 PO_Lines 是采购单：Qty 必须是订购数量，与 GR_Lines 的 Ordered Qty
+//     一致；不能用 accepted_qty（实收数量）顶替——实收属于 GR，不属于 PO。
+//     （2026-11-12 PAD 数据合约核对修正：此前误用 accepted_qty，导致 PO Qty=实收、
+//       GR Ordered Qty=订购 两个口径不一致。）
 //   * Item Code / Supplier Code 保持原字符串（前导零安全），不 trim、不改大小写。
 //   * UOM / Unit Price 原样输出，不做单位换算、不做价格重算。
 //   * 普通单（standard）固定 7 列，与 PAD 现有导入完全一致，不追加日期列。
@@ -128,12 +132,12 @@ export function buildPoLineRows(header, lines, options = {}) {
 
   const list = Array.isArray(lines) ? lines : []
   const rows = list.map((l, i) => {
-    const rawQty = l.accepted_qty ?? l.qty
+    const rawQty = l.original_qty ?? l.qty
     // 空值不允许静默变成 0（Number(null) === 0），否则会把缺数量写成零收
     if (rawQty === null || rawQty === undefined || rawQty === '') {
       throw new PoExportError(
         'INVALID_LINE_QTY',
-        `第 ${i + 1} 行（${l.item_code ?? '?'}）缺少数量（qty/accepted_qty 均为空）`,
+        `第 ${i + 1} 行（${l.item_code ?? '?'}）缺少数量（qty/original_qty 均为空）`,
       )
     }
     if (l.unit_price === null || l.unit_price === undefined || l.unit_price === '') {

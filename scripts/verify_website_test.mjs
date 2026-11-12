@@ -4,9 +4,11 @@
 //   node scripts/verify_website_test.mjs --dir <目录> [--po PO-000009]
 //
 // 从真实预览库读回 PO 表头/明细，与同目录下 WEBSITE_PO_TEST.xlsx /
-// WEBSITE_GR_TEST.xlsx 逐项核对，输出逐条 PASS/FAIL 报告（退出码 0=全过）。
-// 覆盖：身份一致、供应商一致、Item/UOM/数量一致、重复 receipt_event_id 被拒、
-//       未核实 IRS 编号保持空白。
+// WEBSITE_GR_TEST.xlsx 逐行逐字段核对，输出逐条 PASS/FAIL 报告（退出码 0=全过）。
+// 覆盖：身份一致、供应商一致、逐行 Item Code/UOM/Description/Unit Price 严格对照、
+//       PO Qty == GR Ordered Qty（订购口径）、Accepted Qty 独立核对、
+//       source_line_ids 可追溯、重复 Item Code / 同 UOM 不同价格正确区分、
+//       未核实 IRS 编号保持空白（重复 receipt_event_id 由 DB 唯一索引拦截，见 SQL 测试）。
 import path from 'node:path'
 import fs from 'node:fs'
 import ExcelJS from 'exceljs'
@@ -32,6 +34,21 @@ function parseArgs(argv) {
     else if (argv[i] === '--help' || argv[i] === '-h') args.help = true
   }
   return args
+}
+
+/** 数值归一：number/字符串/空 统一转 number 后比较（价格/数量可能被 Excel 存成 number） */
+function numEq(a, b) {
+  const na = Number(a)
+  const nb = Number(b)
+  if (Number.isFinite(na) && Number.isFinite(nb)) return na === nb
+  return String(a ?? '') === String(b ?? '')
+}
+
+/** 文本归一：空单元格（undefined/null）与空串等价，其余按字符串精确比较（前导零安全） */
+function textEq(a, b) {
+  const sa = a === undefined || a === null ? '' : String(a)
+  const sb = b === undefined || b === null ? '' : String(b)
+  return sa === sb
 }
 
 async function main() {
@@ -119,28 +136,86 @@ async function main() {
     ? pass('PO_Lines 供应商与库一致')
     : fail('PO_Lines 供应商', `${poSupplierCode}/${poSupplierName} vs ${header.supplier_code}/${header.supplier_name}`)
 
-  // ---- 5) Item / UOM / 数量一致（PO_Lines vs GR_Lines vs 库） ----
+  // ---- 5) 逐行严格核对（positional，不按 item_code 查表，区分重复 item_code / 同 UOM 不同价） ----
   const grHeader = grLines[0]
   const grDataRows = grLines.slice(1).filter((r) => r.some((c) => c !== undefined && c !== null && c !== ''))
-  grDataRows.length === lines.length
-    ? pass(`GR_Lines 行数与库明细一致（${grDataRows.length}）`)
-    : fail('GR_Lines 行数', `${grDataRows.length} vs ${lines.length}`)
-  const itemIdx = grHeader.indexOf('Item Code')
-  const uomIdx = grHeader.indexOf('UOM')
-  const ordIdx = grHeader.indexOf('Ordered Qty')
-  const accIdx = grHeader.indexOf('Accepted Qty')
-  const itemsMatch = grDataRows.length === lines.length && grDataRows.every((r, i) => {
+  const poIdx = {
+    item: poHeader.indexOf('Item Code'),
+    uom: poHeader.indexOf('UOM'),
+    desc: poHeader.indexOf('Description'),
+    price: poHeader.indexOf('Unit Price (RM)'),
+    qty: poHeader.indexOf('Qty'),
+  }
+  const grIdx = {
+    item: grHeader.indexOf('Item Code'),
+    uom: grHeader.indexOf('UOM'),
+    desc: grHeader.indexOf('Description'),
+    price: grHeader.indexOf('Unit Price (RM)'),
+    ord: grHeader.indexOf('Ordered Qty'),
+    acc: grHeader.indexOf('Accepted Qty'),
+    srcLine: grHeader.indexOf('Source Line IDs'),
+    srcPo: grHeader.indexOf('Source PO'),
+  }
+
+  const lineCountOk = poDataRows.length === lines.length && grDataRows.length === lines.length
+  lineCountOk
+    ? pass(`PO_Lines / GR_Lines / 库 行数一致（各 ${lines.length} 行）`)
+    : fail('行数', `PO=${poDataRows.length} GR=${grDataRows.length} 库=${lines.length}`)
+
+  // 重复 item_code 检测：同 item_code 多行必须靠 UOM/价格/描述/位置区分，逐行按位置对齐
+  const codeCounts = new Map()
+  for (const l of lines) codeCounts.set(l.item_code, (codeCounts.get(l.item_code) ?? 0) + 1)
+  const dupCodes = [...codeCounts.entries()].filter(([, n]) => n > 1).map(([c]) => c)
+  if (dupCodes.length) {
+    pass(`重复 Item Code 已识别（${dupCodes.join(', ')}），逐行按位置+UOM+价格+描述区分`)
+  }
+
+  const maxRows = Math.max(poDataRows.length, grDataRows.length, lines.length)
+  let perLineAllOk = true
+  const perLineReport = []
+  for (let i = 0; i < maxRows; i += 1) {
     const l = lines[i]
-    return (
-      String(r[itemIdx]) === String(l.item_code) &&
-      String(r[uomIdx]) === String(l.uom ?? '') &&
-      Number(r[ordIdx]) === Number(l.original_qty ?? l.qty) &&
-      Number(r[accIdx]) === Number(l.accepted_qty ?? l.qty)
-    )
-  })
-  itemsMatch
-    ? pass('Item / UOM / 订购·实收数量一致（PO·GR·库）')
-    : fail('Item/UOM/数量', '存在不一致明细行')
+    const p = poDataRows[i]
+    const g = grDataRows[i]
+    if (!l) { perLineReport.push(`第 ${i + 1} 行：库无此明细`); perLineAllOk = false; continue }
+    if (!p) { perLineReport.push(`第 ${i + 1} 行：PO_Lines 无此行`); perLineAllOk = false; continue }
+    if (!g) { perLineReport.push(`第 ${i + 1} 行：GR_Lines 无此行`); perLineAllOk = false; continue }
+
+    const label = `#${i + 1} ${l.item_code}/${l.uom ?? '-'}/RM${l.unit_price}`
+    const problems = []
+    if (!textEq(p[poIdx.item], l.item_code)) problems.push(`Item Code PO=${p[poIdx.item]} 库=${l.item_code}`)
+    if (!textEq(g[grIdx.item], l.item_code)) problems.push(`Item Code GR=${g[grIdx.item]} 库=${l.item_code}`)
+    if (!textEq(p[poIdx.uom], l.uom ?? '')) problems.push(`UOM PO=${p[poIdx.uom]} 库=${l.uom ?? ''}`)
+    if (!textEq(g[grIdx.uom], l.uom ?? '')) problems.push(`UOM GR=${g[grIdx.uom]} 库=${l.uom ?? ''}`)
+    if (!textEq(p[poIdx.desc], l.description)) problems.push(`Description PO="${p[poIdx.desc]}" 库="${l.description}"`)
+    if (!textEq(g[grIdx.desc], l.description)) problems.push(`Description GR="${g[grIdx.desc]}" 库="${l.description}"`)
+    if (!numEq(p[poIdx.price], l.unit_price)) problems.push(`Unit Price PO=${p[poIdx.price]} 库=${l.unit_price}`)
+    if (!numEq(g[grIdx.price], l.unit_price)) problems.push(`Unit Price GR=${g[grIdx.price]} 库=${l.unit_price}`)
+
+    // 核心契约：PO Qty == GR Ordered Qty == 订购数量（original_qty ?? qty）
+    const ordered = Number(l.original_qty ?? l.qty)
+    if (!numEq(p[poIdx.qty], ordered)) problems.push(`PO Qty=${p[poIdx.qty]} != 订购 ${ordered}`)
+    if (!numEq(g[grIdx.ord], ordered)) problems.push(`GR Ordered Qty=${g[grIdx.ord]} != 订购 ${ordered}`)
+    if (!numEq(p[poIdx.qty], g[grIdx.ord])) problems.push(`PO Qty=${p[poIdx.qty]} != GR Ordered Qty=${g[grIdx.ord]}`)
+
+    // Accepted Qty 独立核对（实收，可与订购不同）
+    const accepted = Number(l.accepted_qty ?? l.qty)
+    if (!numEq(g[grIdx.acc], accepted)) problems.push(`GR Accepted Qty=${g[grIdx.acc]} != 实收 ${accepted}`)
+
+    // source_line_ids 可追溯：与 DB source_refs 的 line_id 对齐
+    const refLineIds = (Array.isArray(l.source_refs) ? l.source_refs : []).map((r) => r.line_id).join(', ')
+    if (!textEq(g[grIdx.srcLine], refLineIds)) problems.push(`Source Line IDs GR="${g[grIdx.srcLine]}" 库="${refLineIds}"`)
+    const refPos = (Array.isArray(l.source_refs) ? l.source_refs : []).map((r) => r.po_number).join(', ')
+    if (!textEq(g[grIdx.srcPo], refPos)) problems.push(`Source PO GR="${g[grIdx.srcPo]}" 库="${refPos}"`)
+
+    if (problems.length) {
+      perLineAllOk = false
+      perLineReport.push(`${label}：${problems.join('；')}`)
+    }
+  }
+  perLineAllOk
+    ? pass('逐行严格核对：Item Code / UOM / Description / Unit Price / PO Qty==GR Ordered Qty / Accepted Qty / 来源追溯 全部一致')
+    : fail('逐行核对', perLineReport.join('\n    '))
 
   // ---- 6) 批准快照状态（v2 + verified，证明日期/明细与冻结摘要一致） ----
   grInfoMap.get('approval_snapshot_version') === 2 && grInfoMap.get('approval_snapshot_status') === 'verified'
@@ -149,9 +224,9 @@ async function main() {
 
   // ---- 汇总 ----
   const failed = results.filter((r) => !r.ok)
-  console.log(`\n=== Website 内部 Excel 核对：${args.po} ===`)
+  console.log(`\n=== Website 内部 Excel 逐行核对：${args.po} ===`)
   for (const r of results) {
-    console.log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name}${r.ok ? '' : `  -> ${r.msg}`}`)
+    console.log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name}${r.ok ? '' : `\n     -> ${r.msg}`}`)
   }
   console.log(`\n结果：${results.length - failed.length}/${results.length} 通过`)
   return failed.length ? 1 : 0
