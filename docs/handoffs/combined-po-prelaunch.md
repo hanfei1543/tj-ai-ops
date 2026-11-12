@@ -4,7 +4,7 @@
 - 完成 feature/combined-po 上线前日期与独立冻结修正，保留普通单流程；以真实隔离数据库、浏览器、Excel 读回、自动测试和独立审查验收，以本地 commit 保存，不以正式部署为完成标准。
 
 ## 下一步
-- 接续锚点：先复核本交接单与 docs/SOT.md 当前状态及剩余风险，等待用户明确下一步授权；未经用户确认，不 merge/push main、不部署生产、不执行真实 Windows Queue 测试。本轮本地提交以 git log 为准。
+- 接续锚点：先复核本交接单与 docs/SOT.md 当前状态及剩余风险，等待用户明确下一步授权；未经用户确认，不 merge/push main、不部署生产、不执行真实 Windows Queue 测试。代码已本地提交并复核工作区干净，精确提交以 git log 为准；临时本地测试服务器已停止，不再假定回归端口在线。
 
 ## 已定结论与理由
 用户明确选择方案 A：Website PO Date 是 Combined PO 的正式采购单业务日期，由开单人或核对人在提交审批前明确选择。不得默认当天，不从 created_at、received_at、approved_at 推算。缺日期不得提交最终审批、批准或推送。批准后日期与商品明细一起冻结。PO_Lines 保留原 7 列并在 Combined PO 末尾追加 Website PO Date，文本格式 yyyy-MM-dd；IRS 画面转换以后交 PAD。
