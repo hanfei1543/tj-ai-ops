@@ -15,7 +15,10 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 
 // 独立 client，不套用 DYT 的 Database 泛型（tj_* 表不在其中）
-const db = createClient(supabaseUrl, supabaseAnonKey)
+// VITE_SUPABASE_SCHEMA 仅 Preview 隔离环境设置（=tj_preview）；生产不设则走 public。
+const db = createClient(supabaseUrl, supabaseAnonKey, {
+  db: { schema: import.meta.env.VITE_SUPABASE_SCHEMA || 'public' },
+})
 
 /** 去掉 ilike 通配符/转义字符，防止用户输入破坏查询 */
 function clean(q: string): string {
