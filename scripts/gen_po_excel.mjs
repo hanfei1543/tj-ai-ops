@@ -46,6 +46,18 @@ export function parseArgs(argv) {
       args.outDir = path.resolve(v)
     } else if (a.startsWith('--out=')) {
       args.outDir = path.resolve(a.slice(6))
+    } else if (a === '--po-name') {
+      const v = argv[++i]
+      if (!v) throw new Error('--po-name 需要文件名')
+      args.poName = v
+    } else if (a.startsWith('--po-name=')) {
+      args.poName = a.slice(10)
+    } else if (a === '--gr-name') {
+      const v = argv[++i]
+      if (!v) throw new Error('--gr-name 需要文件名')
+      args.grName = v
+    } else if (a.startsWith('--gr-name=')) {
+      args.grName = a.slice(10)
     } else if (a === '--help' || a === '-h') {
       args.help = true
     } else {
@@ -65,7 +77,7 @@ async function main() {
     return 1
   }
   if (args.help) {
-    console.log('node scripts/gen_po_excel.mjs --po PO-000003 [--mode review|formal] [--out DIR]')
+    console.log('node scripts/gen_po_excel.mjs --po PO-000003 [--mode review|formal] [--out DIR] [--po-name FILE] [--gr-name FILE]')
     return 0
   }
 
@@ -85,6 +97,8 @@ async function main() {
       poIds: args.poIds,
       mode: args.mode,
       outDir: args.outDir,
+      poName: args.poName ?? null,
+      grName: args.grName ?? null,
     })
     console.log(`mode: ${out.mode}`)
     for (const f of out.files) {

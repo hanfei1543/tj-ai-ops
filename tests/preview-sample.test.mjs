@@ -331,3 +331,24 @@ test('默认输出目录在 scratch 下，不是 /tmp', async () => {
   assert.ok(mod.DEFAULT_OUT_DIR.startsWith(SCRATCH_ROOT), mod.DEFAULT_OUT_DIR)
   assert.equal(mod.DEFAULT_OUT_DIR.startsWith('/tmp'), false)
 })
+
+test('formal 模式：自定义 --po-name / --gr-name 输出文件名生效', async () => {
+  const outDir = tmpDir('custom-names')
+  const header = await verifiedCombinedHeader()
+  const { fetchImpl } = makeRest({ headersById: { 'PO-000003': header } })
+  const rest = createPreviewRest({ url: 'https://sb.test', anonKey: 'anon-key', fetchImpl })
+  const out = await generatePreviewSample({
+    rest,
+    poIds: ['PO-000003'],
+    mode: 'formal',
+    outDir,
+    poName: 'WEBSITE_PO_TEST.xlsx',
+    grName: 'WEBSITE_GR_TEST.xlsx',
+    log: { log: () => {}, warn: () => {} },
+  })
+  const poFile = out.files.find((f) => f.kind === 'po')
+  const grFile = out.files.find((f) => f.kind === 'gr')
+  assert.equal(path.basename(poFile.path), 'WEBSITE_PO_TEST.xlsx')
+  assert.equal(path.basename(grFile.path), 'WEBSITE_GR_TEST.xlsx')
+  fs.rmSync(outDir, { recursive: true, force: true })
+})

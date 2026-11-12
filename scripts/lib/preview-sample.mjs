@@ -99,6 +99,8 @@ export async function generatePreviewSample({
   fsImpl = fs,
   now = () => new Date(),
   log = console,
+  poName = null,
+  grName = null,
 } = {}) {
   if (typeof rest !== 'function') throw new Error('generatePreviewSample 需要 rest')
   if (mode !== 'review' && mode !== 'formal') {
@@ -176,8 +178,8 @@ export async function generatePreviewSample({
     if (isReview) poSheets.push(reviewNoticeSheet(reviewReasons))
     poSheets.push({ name: 'PO_Lines', columns: poExport.columns, rows: poExport.rows })
 
-    const poName = isReview ? `${REVIEW_PREFIX}${poId}.xlsx` : `${poId}.xlsx`
-    const poPath = path.join(outDir, poName)
+    const poNameFinal = poName || (isReview ? `${REVIEW_PREFIX}${poId}.xlsx` : `${poId}.xlsx`)
+    const poPath = path.join(outDir, poNameFinal)
     const poBlob = await buildWorkbook(poSheets)
     fsImpl.writeFileSync(poPath, Buffer.from(await poBlob.arrayBuffer()))
 
@@ -188,8 +190,8 @@ export async function generatePreviewSample({
       { name: 'GR_Info', columns: GR_INFO_COLUMNS, rows: buildGrInfoRows(grHeader).map(([field, value]) => ({ field, value })) },
       { name: 'GR_Lines', columns: GR_LINE_COLUMNS, rows: buildGrLineRows(Array.isArray(lines) ? lines : []) },
     )
-    const grName = isReview ? `${REVIEW_PREFIX}GR_${poId}.xlsx` : `GR_${poId}.xlsx`
-    const grPath = path.join(outDir, grName)
+    const grNameFinal = grName || (isReview ? `${REVIEW_PREFIX}GR_${poId}.xlsx` : `GR_${poId}.xlsx`)
+    const grPath = path.join(outDir, grNameFinal)
     const grBlob = await buildWorkbook(grSheets)
     fsImpl.writeFileSync(grPath, Buffer.from(await grBlob.arrayBuffer()))
 
