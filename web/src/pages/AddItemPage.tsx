@@ -17,6 +17,7 @@ import {
   updateItemRequestStatus,
 } from '@/lib/tjPoApi'
 import { downloadItemMasterExcel } from '@/lib/tjPoExcel'
+import { ADD_ITEM_WRITES_ENABLED } from '@/lib/featureFlags'
 import type { ItemRequest } from '@/types/tjPo'
 
 const CREATED_BY_OPTIONS = ['Ms Toh', 'Ngam Cheng Jye', 'Keh Lee', 'Ms Teow', 'Ah Huat']
@@ -98,7 +99,14 @@ export default function AddItemPage() {
     }
   }
 
+  function blocked(): boolean {
+    if (ADD_ITEM_WRITES_ENABLED) return false
+    setError('Add New Item 已停用：写入通道关闭（IRS Item Master 字段未验收），只能查看历史申请')
+    return true
+  }
+
   async function handleSubmit() {
+    if (blocked()) return
     if (!form.item_code.trim() || !form.description.trim()) {
       setError('Item Code 和 Description 为必填')
       return
@@ -131,6 +139,7 @@ export default function AddItemPage() {
   }
 
   async function handleApprove(r: ItemRequest) {
+    if (blocked()) return
     setError('')
     try {
       await approveItemRequest(r.id, createdBy)
@@ -141,6 +150,7 @@ export default function AddItemPage() {
   }
 
   async function handleReject(r: ItemRequest) {
+    if (blocked()) return
     if (!window.confirm('确定拒绝此商品申请？')) return
     try {
       await rejectItemRequest(r.id)
@@ -151,6 +161,7 @@ export default function AddItemPage() {
   }
 
   async function handleExport(rs: ItemRequest[]) {
+    if (blocked()) return
     setError('')
     try {
       await downloadItemMasterExcel(rs)
@@ -165,6 +176,7 @@ export default function AddItemPage() {
   }
 
   async function handleMarkResult(r: ItemRequest, status: 'created' | 'needs_review', result?: string) {
+    if (blocked()) return
     setError('')
     try {
       await updateItemRequestStatus(r.id, status, status === 'created' ? 'irs_created' : 'failed', result)
@@ -175,6 +187,32 @@ export default function AddItemPage() {
   }
 
   const approved = requests.filter((r) => r.status === 'approved')
+
+  // Add New Item 已暂停：没有界面入口，也没有隐藏快捷键；直链进入只看到停用说明。
+  // 页面直链仍保留只是为了给出明确说明，写操作在 API 层一律拒绝。
+  if (!ADD_ITEM_WRITES_ENABLED) {
+    return (
+      <div className="min-h-screen bg-slate-50 px-4 py-6 md:px-8">
+        <div className="mx-auto max-w-xl">
+          <button
+            type="button"
+            onClick={() => navigate('/tj-po-system')}
+            className="mb-4 inline-flex items-center gap-1.5 text-sm font-medium text-slate-500 hover:text-slate-800"
+          >
+            <ArrowLeft className="h-4 w-4" /> 返回采购单
+          </button>
+          <div className="rounded-2xl border border-slate-200 bg-white p-6">
+            <h1 className="text-lg font-bold text-slate-900">新增商品（Item Master）功能已暂停</h1>
+            <p className="mt-2 text-sm text-slate-600">
+              IRS Item Master 实际必填字段尚未验收，本功能已停用：页面直链不可用，写操作（新建/批准/拒绝/回写）
+              在 API 层一律拒绝。
+            </p>
+            <p className="mt-2 text-sm text-slate-500">如需核对历史申请，请联系管理员使用内部入口。</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 px-4 py-6 md:px-8">
@@ -195,13 +233,19 @@ export default function AddItemPage() {
           当 Supplier 有新商品、IRS 尚未建立 Item Code 时，先在此提交申请。审批通过后导出独立 Item Master 数据包，由 Windows/PAD 核对 IRS 后建立。与「把已有商品加进采购单」是两个独立流程。
         </p>
 
+        <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          {ADD_ITEM_WRITES_ENABLED
+            ? '功能可用'
+            : '只读模式：Add New Item 写入已停用（IRS 字段未验收），所有写操作会被拒绝。'}
+        </div>
+
         {error && (
           <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
         )}
 
         {/* 操作栏 */}
         <div className="mb-4 flex items-center gap-3">
-          {!showForm && (
+          {!showForm && ADD_ITEM_WRITES_ENABLED && (
             <button
               type="button"
               onClick={() => setShowForm(true)}

@@ -10,15 +10,25 @@ import type {
   PoWithLines,
   Supplier,
 } from '@/types/tjPo'
+import { ADD_ITEM_WRITES_ENABLED } from './featureFlags'
+import {
+  approveCombinedPoFlow,
+  submitCombinedForApprovalFlow,
+} from './core/approve-flow.js'
+import { formatWebsitePoDate } from './core/po-lines.js'
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 
 // 独立 client，不套用 DYT 的 Database 泛型（tj_* 表不在其中）
 // VITE_SUPABASE_SCHEMA 仅 Preview 隔离环境设置（=tj_preview）；生产不设则走 public。
+const DB_SCHEMA = import.meta.env.VITE_SUPABASE_SCHEMA || 'public'
 const db = createClient(supabaseUrl, supabaseAnonKey, {
-  db: { schema: import.meta.env.VITE_SUPABASE_SCHEMA || 'public' },
+  db: { schema: DB_SCHEMA },
 })
+
+/** 预览隔离环境（tj_preview）：禁止任何推送动作，推送只允许生产 public 发起 */
+export const IS_PREVIEW_SCHEMA = DB_SCHEMA !== 'public'
 
 /** 去掉 ilike 通配符/转义字符，防止用户输入破坏查询 */
 function clean(q: string): string {
@@ -211,17 +221,37 @@ export async function markExported(id: string, poId: string, filename: string): 
     .limit(1)
 }
 
-/** 请求 VPS 推送到目标电脑：status confirmed -> pending_push（VPS 推送器轮询后生成 Excel 经桥写入目标机） */
+/** 请求 VPS 推送到目标电脑：status confirmed -> pending_push（VPS 推送器轮询后生成 Excel 经桥写入目标机）
+ *
+ * 上线前冻结口径（与推送器 scripts/lib/po-push-core.mjs 同源规则）：
+ *   * 合并单（po_type=combined）永久拒绝，不看 frozen/status。
+ *   * 已并入某合并单的来源单永久拒绝——按来源关系判定，状态被改回 confirmed 也不能绕过。
+ *   * 普通 standard 单保持原有 queue/bridge 路径。
+ */
 export async function requestPush(id: string): Promise<void> {
-  // 合并单必须已批准冻结才能推送；普通单保持现有流程
+  if (IS_PREVIEW_SCHEMA) {
+    throw new Error('预览环境（tj_preview）禁止推送：推送只允许在生产 public 环境发起')
+  }
   const { data: hdr, error: he } = await db
     .from('tj_po_headers')
-    .select('po_type, frozen')
+    .select('po_id, po_type, status, frozen')
     .eq('id', id)
     .single()
   if (he) throw he
-  if (hdr?.po_type === 'combined' && !hdr?.frozen) {
-    throw new Error('合并单尚未批准冻结，不能推送')
+  if (hdr?.po_type === 'combined') {
+    throw new Error('合并单永久冻结推送（po_type=combined），只能在内部核对/导出 Excel')
+  }
+  // 关系拦截：该单是否被任一合并单引用为来源单
+  const { data: owners, error: ce } = await db
+    .from('tj_po_headers')
+    .select('po_id')
+    .eq('po_type', 'combined')
+    .contains('source_po_ids', [hdr?.po_id])
+    .limit(5)
+  if (ce) throw ce
+  if (owners && owners.length > 0) {
+    const list = owners.map((o: { po_id: string }) => o.po_id).join(', ')
+    throw new Error(`该采购单已并入合并单 ${list}，不能单独推送`)
   }
   const { error } = await db
     .from('tj_po_headers')
@@ -246,33 +276,75 @@ export async function listExports(poId: string): Promise<PoExportRecord[]> {
 // Combined PO（合并采购单）
 // ---------------------------------------------------------------------------
 
-/** 批量把来源 PO 置为指定状态（combining / combined / 恢复 confirmed） */
-async function setSourcePosStatus(poNumbers: string[], status: string, onlyFrom?: string[]): Promise<void> {
-  if (!poNumbers.length) return
-  let q = db.from('tj_po_headers').update({ status, updated_at: new Date().toISOString() }).in('po_id', poNumbers)
+/** 批量把来源 PO 置为指定状态（combining / combined / 恢复 confirmed）；返回实际更新行数 */
+async function setSourcePosStatus(
+  poNumbers: string[],
+  status: string,
+  onlyFrom?: string[]
+): Promise<{ updated: number }> {
+  if (!poNumbers.length) return { updated: 0 }
+  let q = db
+    .from('tj_po_headers')
+    .update({ status, updated_at: new Date().toISOString() })
+    .in('po_id', poNumbers)
   if (onlyFrom?.length) q = q.in('status', onlyFrom)
-  const { error } = await q
+  const { data, error } = await q.select('po_id')
   if (error) throw error
+  return { updated: (data ?? []).length }
 }
 
-/** 创建合并单：header po_type=combined + status=draft，明细带来源追溯；来源 PO 置 combining 锁定 */
+/** 数据库是否已有 website_po_date 列（迁移未应用时为 false；缓存结果，避免每次写库都探测） */
+let websitePoDateColumnSupported: boolean | null = null
+export async function probeWebsitePoDateColumn(): Promise<boolean> {
+  if (websitePoDateColumnSupported !== null) return websitePoDateColumnSupported
+  const { error } = await db.from('tj_po_headers').select('website_po_date').limit(1)
+  websitePoDateColumnSupported = !error
+  return websitePoDateColumnSupported
+}
+
+/** 创建合并单：header po_type=combined + status=draft，明细带来源追溯；来源 PO 置 combining 锁定
+ *
+ * website_po_date 为开单/核对人显式选择的业务日期（yyyy-MM-dd），提交审批必需。
+ * 日期缺失、格式非法、或数据库尚未启用该列时一律 fail closed 抛错——绝不静默跳过日期继续建单，
+ * 也绝不回退成 created_at / received_at / approved_at 或默认当天。
+ */
 export async function createCombinedPo(
   supplier: Supplier,
   sourceHeaders: PoHeader[],
   lines: CombinedLineInput[],
-  createdBy: string
+  createdBy: string,
+  websitePoDate?: string | null
 ): Promise<PoHeader> {
+  // 先做纯校验（格式非法直接抛出，不触碰数据库）
+  const date = formatWebsitePoDate(websitePoDate)
+  if (!date) {
+    throw new Error(
+      'Website PO Date 必填：必须由开单/核对人显式选择业务日期后才能提交审批；' +
+        '系统不默认当天，也不用创建/收货/审批时间代替。'
+    )
+  }
+  // 迁移未应用时不能保存日期：直接阻止合并，不允许"跳过日期继续审批"
+  if (!(await probeWebsitePoDateColumn())) {
+    throw new Error(
+      '数据库未启用 website_po_date 列（迁移待应用）：无法保存 Website PO Date，合并已阻止。' +
+        '请先由管理员应用迁移，不能无日期继续提交审批。'
+    )
+  }
+
   const sourcePoNumbers = sourceHeaders.map((p) => p.po_id)
+  const row: Record<string, unknown> = {
+    supplier_code: supplier.code,
+    supplier_name: supplier.name,
+    status: 'draft',
+    po_type: 'combined',
+    source_po_ids: sourcePoNumbers,
+    created_by: createdBy,
+    website_po_date: date,
+  }
+
   const { data: header, error: he } = await db
     .from('tj_po_headers')
-    .insert({
-      supplier_code: supplier.code,
-      supplier_name: supplier.name,
-      status: 'draft',
-      po_type: 'combined',
-      source_po_ids: sourcePoNumbers,
-      created_by: createdBy,
-    })
+    .insert(row)
     .select()
     .single()
   if (he) throw he
@@ -323,48 +395,99 @@ export async function updateCombinedPoLines(id: string, lines: CombinedLineInput
   if (le) throw le
 }
 
-/** 前台确认完成，提交审批：draft -> pending_approval，记录核对人、送货单号、收货事件 ID */
+/**
+ * 合并单提交/批准的真实 IO（全部条件更新，命中 0 行即失败）。
+ *
+ * PostgREST 里 `update ... where` 更新 0 行不是错误，所以必须
+ * `.select().single()` 读回确认；否则会出现「界面已提交/已批准、库里没动」的假成功。
+ */
+const combinedApproveIo = {
+  async readHeader(id: string): Promise<PoHeader> {
+    const { data, error } = await db.from('tj_po_headers').select('*').eq('id', id).single()
+    if (error) throw error
+    return data as PoHeader
+  },
+  async readLines(id: string): Promise<PoLine[]> {
+    const { data, error } = await db
+      .from('tj_po_lines')
+      .select('*')
+      .eq('po_header_id', id)
+      .order('line_no')
+    if (error) throw error
+    return (data ?? []) as PoLine[]
+  },
+  async updateHeaderConditional({
+    id,
+    expectStatus,
+    expectFrozen,
+    patch,
+  }: {
+    id: string
+    expectStatus: string
+    expectFrozen: boolean
+    patch: Record<string, unknown>
+  }): Promise<PoHeader | null> {
+    const { data, error } = await db
+      .from('tj_po_headers')
+      .update(patch)
+      .eq('id', id)
+      .eq('status', expectStatus)
+      .eq('frozen', expectFrozen)
+      .select('*')
+      .single()
+    if (error) {
+      // PGRST116：条件不匹配、0 行受影响 —— 由编排层判定为失败（绝不当作成功）
+      if ((error as { code?: string }).code === 'PGRST116') return null
+      if (/approval_snapshot_version/.test(error.message ?? '')) {
+        throw new Error(
+          '数据库未启用 approval_snapshot_version 列（迁移待应用）：不能写入 v2 批准快照，批准已阻止。'
+        )
+      }
+      throw error
+    }
+    return data as PoHeader
+  },
+  updateSourceStatuses({
+    poNumbers,
+    status,
+    onlyFrom,
+  }: {
+    poNumbers: string[]
+    status: string
+    onlyFrom: string[]
+  }): Promise<{ updated: number }> {
+    return setSourcePosStatus(poNumbers, status, onlyFrom)
+  },
+}
+
+/** 前台确认完成，提交审批：draft -> pending_approval，记录核对人、送货单号、收货事件 ID
+ *
+ * 日期双校验 1/2：提交前从数据库读回 website_po_date（不信任调用方传参），
+ * 缺失/非法直接拒绝，绝不允许"跳过日期继续审批"。
+ * 条件更新 status=draft 且 frozen=false，命中 0 行直接失败（不假成功）。
+ */
 export async function submitCombinedForApproval(
   id: string,
   checkedBy: string,
   deliveryOrderNo?: string
 ): Promise<void> {
-  const receiptEventId = crypto.randomUUID()
-  const { error } = await db
-    .from('tj_po_headers')
-    .update({
-      status: 'pending_approval',
-      checked_by: checkedBy,
-      delivery_order_no: deliveryOrderNo ?? null,
-      receipt_event_id: receiptEventId,
-      received_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', id)
-  if (error) throw error
+  await submitCombinedForApprovalFlow({
+    io: combinedApproveIo,
+    id,
+    checkedBy,
+    deliveryOrderNo: deliveryOrderNo ?? null,
+  })
 }
 
-/** 审批人批准并冻结：pending_approval -> confirmed(frozen=true)；来源 PO 置 combined */
-export async function approveCombinedPo(
-  id: string,
-  approvedBy: string,
-  sourceSha256: string
-): Promise<void> {
-  const { error } = await db
-    .from('tj_po_headers')
-    .update({
-      status: 'confirmed',
-      frozen: true,
-      approved_by: approvedBy,
-      approved_at: new Date().toISOString(),
-      source_sha256: sourceSha256,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', id)
-  if (error) throw error
-
-  const { data: hdr } = await db.from('tj_po_headers').select('source_po_ids').eq('id', id).single()
-  await setSourcePosStatus((hdr?.source_po_ids as string[]) ?? [], 'combined', ['combining'])
+/** 审批人批准并冻结：pending_approval -> confirmed(frozen=true)；来源 PO 置 combined
+ *
+ * 批准摘要（v2）由 DB 读回的 header + lines 计算 —— 不接受调用方 hash。
+ * 日期双校验 2/2：批准前再次从数据库读回 website_po_date 并校验。
+ * 流程：条件更新成功 → 读回重算校验 → 通过后才推进来源单状态；
+ * 读回失败/摘要不一致/来源单 0 行一律报错，绝不当成功。
+ */
+export async function approveCombinedPo(id: string, approvedBy: string): Promise<void> {
+  await approveCombinedPoFlow({ io: combinedApproveIo, id, approvedBy })
 }
 
 /** 取消合并（仅未批准前）：删除合并单 + 恢复来源 PO 为 confirmed */
@@ -401,7 +524,17 @@ export interface ItemRequestInput {
   created_by?: string | null
 }
 
+/** Add New Item 写操作总闸：功能停用期间 API 直接拒绝，避免产生半成品申请 */
+function assertAddItemWritable(action: string): void {
+  if (!ADD_ITEM_WRITES_ENABLED) {
+    throw new Error(
+      `Add New Item 已停用：${action} 被拒绝（IRS Item Master 字段未验收，写入通道关闭）`
+    )
+  }
+}
+
 export async function createItemRequest(input: ItemRequestInput): Promise<ItemRequest> {
+  assertAddItemWritable('新建商品申请')
   const { data, error } = await db
     .from('tj_item_requests')
     .insert({ ...input, status: 'pending', erp_status: 'none' })
@@ -438,6 +571,7 @@ export async function checkItemCodeDuplicate(
 }
 
 export async function approveItemRequest(id: string, approvedBy: string): Promise<void> {
+  assertAddItemWritable('批准商品申请')
   const { error } = await db
     .from('tj_item_requests')
     .update({ status: 'approved', approved_by: approvedBy, approved_at: new Date().toISOString() })
@@ -446,6 +580,7 @@ export async function approveItemRequest(id: string, approvedBy: string): Promis
 }
 
 export async function rejectItemRequest(id: string): Promise<void> {
+  assertAddItemWritable('拒绝商品申请')
   const { error } = await db.from('tj_item_requests').update({ status: 'rejected' }).eq('id', id)
   if (error) throw error
 }
@@ -457,6 +592,7 @@ export async function updateItemRequestStatus(
   erpStatus: string,
   erpResult?: string
 ): Promise<void> {
+  assertAddItemWritable('回写商品申请状态')
   const { error } = await db
     .from('tj_item_requests')
     .update({ status, erp_status: erpStatus, erp_result: erpResult ?? null })

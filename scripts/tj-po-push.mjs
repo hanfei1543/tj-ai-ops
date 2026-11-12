@@ -1,132 +1,67 @@
 #!/usr/bin/env node
-// VPS 推送器：把「待推送」的 PO 生成 Excel，经桥 write 到目标机 PAD 目录。
-// 用法：
-//   node scripts/tj-po-push.mjs --once     # 跑一轮（cron 用）
-//   node scripts/tj-po-push.mjs            # 循环轮询（手动/守护）
-import fs from 'node:fs';
-import ExcelJS from 'exceljs';
+// VPS 推送器入口（cron：`node scripts/tj-po-push.mjs --once`，每分钟一轮）。
+//
+// 业务逻辑全部在 scripts/lib/po-push-core.mjs —— 可 import、可 mock 测试、import 无副作用。
+// 本文件只做装配：读 env、建 REST/bridge 访问器、跑一轮或循环。
+//
+// 永久安全边界（见 core）：合并单与合并来源单拒绝推送；只走 public schema；
+// 普通 standard 单保持原路径（7 列 PO_Lines -> bridge -> exported）。
+import { pathToFileURL } from 'node:url'
+import {
+  createSupabaseRest,
+  createBridgeCall,
+  createPusher,
+  POLL_SEC,
+} from './lib/po-push-core.mjs'
+import { loadEnvFile, ENV_PATH } from './lib/env.mjs'
 
-const ONCE = process.argv.includes('--once');
+export { loadEnvFile, ENV_PATH }
 
-// 读 ~/.hermes/.env 取 Supabase 凭据
-function loadEnv(p) {
-  const env = {};
-  for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (m) env[m[1]] = m[2];
-  }
-  return env;
-}
-const env = loadEnv('/home/hermes/.hermes/.env');
-const SUPABASE_URL = env.SUPABASE_URL;
-const SERVICE_KEY = env.SUPABASE_SERVICE_ROLE_KEY;
-if (!SUPABASE_URL || !SERVICE_KEY) {
-  console.error('缺 Supabase 凭据（SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY）');
-  process.exit(1);
-}
+/**
+ * 装配并运行推送器。依赖可注入，便于测试（测试不会触发真实网络）。
+ * @param {{argv?: string[], env?: object, sbFetch?: Function, bridgeCall?: Function, log?: object, once?: boolean}} opts
+ */
+export async function startPusher(opts = {}) {
+  const argv = opts.argv ?? process.argv.slice(2)
+  const env = opts.env ?? loadEnvFile()
+  const log = opts.log ?? console
+  const once = opts.once ?? argv.includes('--once')
 
-const BRIDGE_URL = 'http://127.0.0.1:9000';
-const TARGET_DIR = 'C:\\Users\\Administrator\\Desktop\\operation\\PO_Queue\\Pending';
-const POLL_SEC = 30;
+  const sbFetch =
+    opts.sbFetch ??
+    createSupabaseRest({
+      url: env.SUPABASE_URL,
+      serviceKey: env.SUPABASE_SERVICE_ROLE_KEY,
+    })
+  const bridgeCall = opts.bridgeCall ?? createBridgeCall()
+  const pusher = createPusher({ sbFetch, bridgeCall, log })
 
-const H = {
-  apikey: SERVICE_KEY,
-  Authorization: `Bearer ${SERVICE_KEY}`,
-  'Content-Type': 'application/json',
-};
-
-async function sbFetch(pathname, opts = {}) {
-  const r = await fetch(SUPABASE_URL + '/rest/v1/' + pathname, { ...opts, headers: H });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`Supabase ${r.status}: ${text}`);
-  return text ? JSON.parse(text) : null;
-}
-
-async function bridgeCall(payload) {
-  const r = await fetch(BRIDGE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`bridge HTTP ${r.status}: ${text}`);
-  return JSON.parse(text);
-}
-
-// 生成 xlsx（对齐 PAD schema，与前端 src/lib/tjPoExcel.ts 一致）
-async function buildXlsx(header, lines) {
-  const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('PO_Lines');
-  ws.columns = [
-    { header: 'Supplier Code', key: 'supplier_code', width: 16 },
-    { header: 'Supplier Name', key: 'supplier_name', width: 38 },
-    { header: 'Item Code', key: 'item_code', width: 16 },
-    { header: 'Description', key: 'description', width: 46 },
-    { header: 'UOM', key: 'uom', width: 10 },
-    { header: 'Qty', key: 'qty', width: 10 },
-    { header: 'Unit Price (RM)', key: 'unit_price', width: 16 },
-  ];
-  ws.getRow(1).font = { bold: true };
-  for (const l of lines) {
-    ws.addRow({
-      supplier_code: header.supplier_code,
-      supplier_name: header.supplier_name,
-      item_code: l.item_code,
-      description: l.description,
-      uom: l.uom ?? '',
-      qty: Number(l.accepted_qty ?? l.qty),
-      unit_price: Number(l.unit_price),
-    });
-  }
-  return Buffer.from(await wb.xlsx.writeBuffer());
-}
-
-async function pushOne(header) {
-  const lines = await sbFetch(`tj_po_lines?select=*&po_header_id=eq.${header.id}&order=line_no`);
-  const buf = await buildXlsx(header, lines);
-  const filename = `${header.po_id}.xlsx`;
-  const winPath = `${TARGET_DIR}\\${filename}`;
-  const res = await bridgeCall({ write: { path: winPath, b64: buf.toString('base64') } });
-  if (!res.ok) throw new Error('bridge write 失败: ' + (res.error || JSON.stringify(res)));
-  // 记录导出历史 + 标 exported（service key 写）
-  const now = new Date().toISOString();
-  await sbFetch('tj_po_exports', {
-    method: 'POST',
-    body: JSON.stringify({ po_header_id: header.id, po_id: header.po_id, filename, exported_at: now }),
-  });
-  await sbFetch(`tj_po_headers?id=eq.${header.id}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ status: 'exported', updated_at: now }),
-  });
-  return filename;
-}
-
-async function runOnce() {
-  const pending = await sbFetch('tj_po_headers?select=*&status=eq.pending_push&order=created_at');
-  for (const h of pending) {
+  if (once) return pusher.runOnce()
+  // 循环模式：单轮异常不影响下一轮
+  for (;;) {
     try {
-      const f = await pushOne(h);
-      console.log(`[ok] ${h.po_id} -> ${f} (${new Date().toISOString()})`);
+      await pusher.runOnce()
     } catch (e) {
-      console.error(`[err] ${h.po_id}: ${e.message}`);
+      log.error('[loop]', e.message)
     }
-  }
-  return pending.length;
-}
-
-async function main() {
-  if (ONCE) {
-    await runOnce();
-    return;
-  }
-  while (true) {
-    try {
-      await runOnce();
-    } catch (e) {
-      console.error('[loop]', e.message);
-    }
-    await new Promise((r) => setTimeout(r, POLL_SEC * 1000));
+    await new Promise((r) => setTimeout(r, POLL_SEC * 1000))
   }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+export async function main(argv = process.argv.slice(2), opts = {}) {
+  try {
+    await startPusher({ argv, ...opts })
+    return 0
+  } catch (e) {
+    console.error(e.message || String(e))
+    return 1
+  }
+}
+
+const isDirectRun =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+if (isDirectRun) {
+  main().then((code) => {
+    if (code !== 0) process.exit(code)
+  })
+}

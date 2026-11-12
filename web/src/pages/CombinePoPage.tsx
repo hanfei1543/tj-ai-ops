@@ -18,9 +18,11 @@ import {
   getItemByCode,
   getPo,
   getPosByIds,
+  probeWebsitePoDateColumn,
   submitCombinedForApproval,
 } from '@/lib/tjPoApi'
 import { downloadGrExcel } from '@/lib/tjPoExcel'
+import { buildCombinedLines } from '@/lib/core/combine.js'
 import type { PoWithLines, SourceRef } from '@/types/tjPo'
 
 const CREATED_BY_OPTIONS = ['Ms Toh', 'Ngam Cheng Jye', 'Keh Lee', 'Ms Teow', 'Ah Huat']
@@ -44,46 +46,20 @@ interface CombineLine {
   is_extra?: boolean // 额外/替代行
 }
 
-/** 把多张来源 PO 的明细按 item_code + uom + 单价 合并；不同 UOM/单价分开 */
-function buildCombinedLines(sourcePos: PoWithLines[]): CombineLine[] {
-  const groups = new Map<string, CombineLine>()
-  for (const po of sourcePos) {
-    for (const l of po.lines) {
-      const key = `${l.item_code}|${l.uom ?? ''}|${Number(l.unit_price)}`
-      const ref: SourceRef = {
-        po_id: po.id,
-        po_number: po.po_id,
-        line_id: l.id ?? '',
-        qty: Number(l.qty),
-      }
-      const existing = groups.get(key)
-      if (existing) {
-        existing.ordered_qty += Number(l.qty)
-        existing.accepted_qty = String(existing.ordered_qty)
-        existing.source_refs.push(ref)
-      } else {
-        groups.set(key, {
-          key: nextKey(),
-          item_code: l.item_code,
-          description: l.description,
-          uom: l.uom,
-          unit_price: Number(l.unit_price),
-          ordered_qty: Number(l.qty),
-          accepted_qty: String(Number(l.qty)),
-          note: '',
-          source_refs: [ref],
-        })
-      }
-    }
-  }
-  return Array.from(groups.values())
-}
-
-async function sha256Hex(text: string): Promise<string> {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
-  return Array.from(new Uint8Array(buf))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
+/** 把多张来源 PO 的明细按 item_code + uom + 单价 合并；规则来自 lib/core/combine（与真实样本脚本同源）。
+ * 不同 UOM / 不同单价 / 不同编号一律分开；组顺序 = 首次出现顺序。 */
+function buildCombineLines(sourcePos: PoWithLines[]): CombineLine[] {
+  return buildCombinedLines(sourcePos).map((g) => ({
+    key: nextKey(),
+    item_code: g.item_code,
+    description: g.description,
+    uom: g.uom,
+    unit_price: g.unit_price,
+    ordered_qty: g.ordered_qty,
+    accepted_qty: String(g.accepted_qty),
+    note: g.note,
+    source_refs: g.source_refs as SourceRef[],
+  }))
 }
 
 export default function CombinePoPage() {
@@ -104,6 +80,9 @@ export default function CombinePoPage() {
 
   const [deliveryOrderNo, setDeliveryOrderNo] = useState('')
   const [checkedBy, setCheckedBy] = useState('')
+  // 合并单没有既定业务日期：由开单/核对人显式填 Website PO Date（yyyy-MM-dd），缺失不允许提交审批
+  const [websitePoDate, setWebsitePoDate] = useState('')
+  const [dateColumnReady, setDateColumnReady] = useState(true)
 
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const [dropIndex, setDropIndex] = useState<number | null>(null)
@@ -141,7 +120,7 @@ export default function CombinePoPage() {
           return
         }
         setSourcePos(pos)
-        setLines(buildCombinedLines(pos))
+        setLines(buildCombineLines(pos))
       })
       .catch((e) => mounted && setError(e.message))
       .finally(() => mounted && setLoading(false))
@@ -149,6 +128,17 @@ export default function CombinePoPage() {
       mounted = false
     }
   }, [ids])
+
+  // 日期列是否已随迁移上线（未上线时提示：填了也不会保存，导出仍需补录）
+  useEffect(() => {
+    let mounted = true
+    probeWebsitePoDateColumn()
+      .then((ok) => mounted && setDateColumnReady(ok))
+      .catch(() => mounted && setDateColumnReady(false))
+    return () => {
+      mounted = false
+    }
+  }, [])
 
   const supplierName = sourcePos[0]?.supplier_name ?? ''
   const supplierCode = sourcePos[0]?.supplier_code ?? ''
@@ -229,11 +219,20 @@ export default function CombinePoPage() {
     setShowCreatorPicker(false)
     const { input, ok } = validLines()
     if (!ok) return
+    const date = websitePoDate.trim()
+    if (!date) {
+      setError('Website PO Date 必填：请由开单/核对人显式选择业务日期后再提交审批；系统不默认当天。')
+      return
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      setError('Website PO Date 必须是 yyyy-MM-dd（例如 2026-11-12），不猜日期')
+      return
+    }
     setBusy(true)
     setError('')
     try {
       const supplier = { id: '', code: supplierCode, name: supplierName }
-      const header = await createCombinedPo(supplier, sourcePos, input, creator)
+      const header = await createCombinedPo(supplier, sourcePos, input, creator, date)
       await submitCombinedForApproval(header.id, checkedBy || creator, deliveryOrderNo)
       setCombinedPoId(header.id)
       setCombinedPoNumber(header.po_id)
@@ -248,24 +247,12 @@ export default function CombinePoPage() {
   async function handleApprove(approver: string) {
     setShowApproverPicker(false)
     if (!combinedPoId) return
-    // source_sha256 = 冻结时来源行数据的摘要（不可篡改对照）
-    const canonical = JSON.stringify(
-      lines
-        .map((l) => ({
-          code: l.item_code,
-          original_qty: l.ordered_qty,
-          accepted_qty: parseFloat(l.accepted_qty) || 0,
-          price: l.unit_price,
-          uom: l.uom,
-          sources: l.source_refs.map((r) => [r.po_number, r.line_id, r.qty]),
-        }))
-        .sort((a, b) => a.code.localeCompare(b.code))
-    )
-    const hash = await sha256Hex(canonical)
+    // 批准快照（v2）由 API 从数据库读回 header + lines 计算，页面不再拼 hash：
+    // 页面 lines 可能未保存/被本地改动，不能作为冻结依据。
     setBusy(true)
     setError('')
     try {
-      await approveCombinedPo(combinedPoId, approver, hash)
+      await approveCombinedPo(combinedPoId, approver)
       setPhase('confirmed')
     } catch (e: any) {
       setError(e.message || '批准失败')
@@ -370,6 +357,10 @@ export default function CombinePoPage() {
               合并单编号：<span className="font-mono font-semibold text-emerald-700">{combinedPoNumber}</span>
               {phase === 'confirmed' && <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-700">已批准冻结</span>}
               {phase === 'pending_approval' && <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">待审批</span>}
+              <div className="mt-2 text-slate-700">
+                Website PO Date（正式采购业务日期）：<span className="font-mono font-semibold">{websitePoDate}</span>
+                {phase === 'confirmed' && <span className="ml-2 text-xs text-slate-500">已随明细冻结</span>}
+              </div>
             </div>
           )}
         </div>
@@ -560,6 +551,26 @@ export default function CombinePoPage() {
         {phase === 'building' && (
           <section className="mb-6 space-y-3">
             <div>
+              <label className="mb-1.5 block text-sm font-medium text-slate-600">
+                Website PO Date（正式采购业务日期，提交审批前必填）
+              </label>
+              <input
+                type="date"
+                value={websitePoDate}
+                onChange={(e) => setWebsitePoDate(e.target.value)}
+                className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+              />
+              <p className="mt-1 text-xs text-slate-500">
+                由开单人或核对人选择日期（yyyy-MM-dd），不是创建、收货或审批日期，不默认当天；批准后随明细冻结。
+                {!dateColumnReady && (
+                  <span className="font-medium text-amber-600">
+                    {' '}
+                    当前数据库尚未启用该日期列（迁移待应用），不能提交审批。
+                  </span>
+                )}
+              </p>
+            </div>
+            <div>
               <label className="mb-1.5 block text-sm font-medium text-slate-600">Delivery Order No.（送货单号，可选）</label>
               <input
                 value={deliveryOrderNo}
@@ -607,7 +618,7 @@ export default function CombinePoPage() {
               <button
                 type="button"
                 onClick={() => setShowCreatorPicker(true)}
-                disabled={busy || !checkedBy}
+                disabled={busy || !checkedBy || !websitePoDate || !dateColumnReady}
                 className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-6 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
               >
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -633,7 +644,7 @@ export default function CombinePoPage() {
                   disabled={busy}
                   className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm font-semibold text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
                 >
-                  <Download className="h-4 w-4" /> 导出收货单 (GR)
+                  <Download className="h-4 w-4" /> 导出收货单 (内部 Excel，不推送 IRS)
                 </button>
                 <button
                   type="button"

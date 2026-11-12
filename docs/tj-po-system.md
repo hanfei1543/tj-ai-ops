@@ -4,7 +4,12 @@
 > 独立业务，与 DYT 中医站隔离（`tj_` 前缀表）。本 SOT 只记 PO 系统，不混入中医业务进度。
 > 建立时间：2026-11-07；2026-11-09 从 DYT-TCM-SAAS 拆出为独立 Vite app（本仓库 `web/`）。
 
-## 1 当前焦点与下一步
+## 当前上线约束（优先于下方历史记录）
+
+2026-11-12 上线前修正：显式 Website PO Date、批准快照 v2、Combined／来源单前后台 Push 冻结、GR 正式推送及过账停用、Add New Item 停用。普通单原 7 列及 Push 路径保留。主状态只看 docs/SOT.md，接续与独立解冻条件看 docs/handoffs/combined-po-prelaunch.md；下方 14/14、旧状态机及部署字样是历史，不代表本轮正式已部署或三个功能已获开放。
+Preview 数据库日期／防绕过／摘要版本迁移已单独应用；本轮 public 迁移仍只准备，不自动应用。回归使用本地 Preview 页面连接真实 tj_preview，没有推送到 Windows Queue，没有 merge/push main，也没有部署本轮托管 Preview 或生产网站。
+
+## 1 历史焦点与下一步（由上述主状态替代）
 
 - **当前焦点**: 三新功能（Combined PO 合并采购单 / 商品拖曳排序 / Add New Item）已实现并隔离验收通过（14/14），未部署、未 push、未写 Windows Queue。数据库 schema 增量迁移（additive，见 supabase/migrations/20261112_combined_po.sql）。
 - **下一步**:
@@ -71,12 +76,12 @@
 - RLS 已启用，anon 可读写（MVP 无登录，后续可收紧）。
 - PO ID 由 identity + trigger（`tj_gen_po_id`）自动生成。
 - 状态机（普通单）：保存=confirmed（未导出）→ 点推送=pending_push（推送中）→ VPS 推完=exported（已导出）。
-- 状态机（合并单）：draft（核对调整）→ pending_approval（待审批）→ confirmed(frozen=true)（批准冻结）→ pending_push → exported；来源单在合并待审批期间标 combining（锁定），批准后标 combined（不可再推），取消合并恢复 confirmed。
+- 状态机（合并单）：draft（核对调整并选择正式采购业务日期）→ pending_approval（待审批）→ confirmed(frozen=true)（批准冻结）；到此停止，pending_push/exported 冻结。来源单在合并待审批期间标 combining，批准后标 combined；推送判定按 source_po_ids 关系，不靠 status，不能把来源状态改回 confirmed 后绕过。
 - 冻结：frozen=true 的 PO 不允许拖曳重排（除非新建审批修订）。
 
 ### Excel 导出格式（对齐 PAD）
 
-- Worksheet 名 `PO_Lines`；列顺序 Supplier Code / Supplier Name / Item Code / Description / UOM / Qty / Unit Price (RM)。
+- Worksheet 名 `PO_Lines`；普通单原 7 列 Supplier Code / Supplier Name / Item Code / Description / UOM / Qty / Unit Price (RM) 不变。Combined PO 在末尾追加 Website PO Date（yyyy-MM-dd 文本）；后台格式生成器也支持 8 列，但实际 Combined Push 仍禁止。
 - Item Code / Supplier Code = 文本（前导零安全）；Qty / Unit Price = 数值。
 - Qty 取 `accepted_qty ?? qty`（合并单导出实收/批准数量，普通单回退订购 qty）；行序按 `line_no`（= 拖曳排序后的最终批准顺序）。
 - Add New Item Master 独立导出 Worksheet 名 `Item_Master`（Item Code / Barcode / Description / UOM / Category / Supplier Code / Purchase Cost / Selling Price / Tax Rate / SST Info）——IRS 实际必填字段尚未验收，此为过渡数据包。

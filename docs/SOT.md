@@ -3,15 +3,15 @@
 > 最后归档: 2026-11-12 06:01
 
 ## 1 当前焦点与下一步
-- 业务一 PO 采购单：三功能（Combined PO / 拖曳排序 / Add New Item）+ GR 收货导出已完成，隔离验收 14/14 通过；Preview 已部署 feature/combined-po（隔离 schema tj_preview），用户已实测合并 PO-000001+PO-000002 → PO-000003 并批准冻结。待用户验收后授权 merge main 部署。真相源 docs/tj-po-system.md；迁移/回滚 docs/migration-rollback-20261112.md。
-- 当前焦点（业务二 IRS POS）：IRS POS 入货试走暂停于导入格式/输入兼容调查；仅选中 ING HAN 供应商 4000/I01，尚未录入明细、保存、过账或修改 Item Master。
-- 下一步（IRS POS）：先读交接并复核桥/窗口现状；找厂家导入模板或软件导出数据样本，确认 Text/Excel 格式。不要把打印 PDF 当导入规范，导出文件也不保证能导回。
-- 已排除/勿重试：node/npm/agent-desktop/SSH 客户端均可运行；explorer/irsPOS/node 同在 Session 1，本机同样复现前台失败，不再重复让用户点搜索框或核对 SessionId。空 txt 无反应、空有效 xlsx 报 external table is not in the expected format，均不代表格式已确定；不盲装 Excel、不猜格式导真货品。
-- 批准边界：用户允许 agent-desktop 键鼠操作，拒绝截图坐标点击；只试 ING HAN D-021660 与 FORTUNE I-107612。首次保存前停给用户确认；无任何已保存业务成果。
-- 接续关键：三货号以用户确认为准 1050006000025 / 1030033000054 / 1030033000068；ING HAN 无 invoice number 用 DO number。MyInvois 按公司名前段检索、DO 当天或之后、最终按货品描述匹配；查价步骤尚未跑通。
+- **接续锚点**：先读 docs/handoffs/combined-po-prelaunch.md 的验收与剩余风险，等待用户明确下一步授权；不 merge/push main 或正式部署。
+- **当前焦点**：feature/combined-po 上线前修正已实测：110 项测试、构建、Preview 数据库集成及浏览器新单 PO-000009 的日期／排序／审批／冻结／摘要复核通过；二次独立核心逻辑复核通过，已知非原子流程／权限风险列入交接。旧 PO-000003 不改，生产数据与序号不变，Preview 测试序号自然推进到 9。本地保存以 git log 为准，不代表生产已上线。
+- **下一步**：① 按接续锚点复核用户授权 ② 决定是否另批托管 Preview 更新或生产迁移、main merge/push、部署 ③ 三项冻结保持；各自验收后才各自申请解除。
+- **已排除/勿重试**：Combined 及来源单 Push、GR 正式 Push／IRS 过账、Add New Item 分别冻结，网站上线不解除；不改旧冻结日期／摘要，不为模拟编号 5 清生产数据，不执行真实 Queue 推送或重置生产序号。旧 IRS POS 任务仍暂停，以 stock-setup 交接为入口。
+- **对外简报**：日期、排序、批准冻结和内部表格已在隔离环境验收，普通单入口保留；正式数据未改、没有推送到电脑，等你确认下一步。
 
 ## 2 交接上下文
-- REQUIRED: docs/handoffs/stock-setup.md
+- REQUIRED: docs/handoffs/combined-po-prelaunch.md
+- 旧 IRS POS 暂停任务：docs/handoffs/stock-setup.md，原批准边界不扩大。
 
 ## 3 未归档缓冲池
-- (空)
+- [PROGRESS] 用户批准方案 A：正式采购业务日期人工选取、不默认当天，缺日期不能提交审批／批准，日期与明细批准后冻结。Preview 迁移及事务集成验收、浏览器新单审批冻结、Excel 逐行读回和摘要复算已通过，最终自动记录为 110 项测试全通过、构建通过；后台来源改定向查询防分页漏拦，二次独立核心逻辑复核通过。旧冻结单保持原状，生产数据／序号不变，三项功能分别停用；遗留非原子创建／并发／权限和待审批恢复入口风险已列交接，未推送或部署，等用户另行授权。详情见当前交接单。

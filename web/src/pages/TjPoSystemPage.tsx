@@ -20,6 +20,7 @@ import {
   createPo,
   deletePo,
   getPo,
+  IS_PREVIEW_SCHEMA,
   listPos,
   reorderLines,
   requestPush,
@@ -289,7 +290,6 @@ export default function TjPoSystemPage() {
       onCreate={() => navigate('/tj-po-system/new')}
       onEdit={(id) => navigate(`/tj-po-system/${id}`)}
       onCombine={(ids) => navigate(`/tj-po-system/combine?ids=${ids.join(',')}`)}
-      onAddItem={() => navigate('/tj-po-system/items')}
     />
   )
 }
@@ -302,12 +302,10 @@ function PoList({
   onCreate,
   onEdit,
   onCombine,
-  onAddItem,
 }: {
   onCreate: () => void
   onEdit: (id: string) => void
   onCombine: (ids: string[]) => void
-  onAddItem: () => void
 }) {
   const [pos, setPos] = useState<PoHeader[]>([])
   const [loading, setLoading] = useState(true)
@@ -315,6 +313,13 @@ function PoList({
   const [exportingId, setExportingId] = useState('')
   const [combineMode, setCombineMode] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+
+  // Add New Item 暂停：界面不显示入口，旧快捷键入口也已移除（直链进入只看到停用说明，
+  // 写 API 同样被拒绝），避免任何隐藏路径绕过暂停。
+  // 合并单来源单集合（按 source_po_ids 关系，不依赖 status）：来源单不显示推送按钮。
+  const combinedSourcePoNumbers = new Set(
+    pos.flatMap((p) => (p.po_type === 'combined' ? (p.source_po_ids ?? []) : []))
+  )
 
   useEffect(() => {
     let mounted = true
@@ -384,13 +389,6 @@ function PoList({
             <p className="mt-1 text-sm text-slate-500">建立采购单、导出 Excel 交给 PAD 录入 IRS</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={onAddItem}
-              className="inline-flex items-center gap-2 whitespace-nowrap rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50"
-            >
-              <Plus className="h-4 w-4" /> 新增商品
-            </button>
             <button
               type="button"
               onClick={() => {
@@ -491,7 +489,15 @@ function PoList({
                       )}
                     </div>
                   </button>
-                  {!combineMode && p.status === 'confirmed' && (
+                  {!combineMode && p.po_type === 'combined' && p.status === 'confirmed' && (
+                    <span
+                      className="shrink-0 rounded-lg border border-slate-200 bg-slate-100 px-2.5 py-1.5 text-xs font-semibold text-slate-500"
+                      title="合并单永久冻结推送：只能在内部核对/导出 Excel"
+                    >
+                      已冻结·不可推送
+                    </span>
+                  )}
+                  {!combineMode && p.status === 'confirmed' && p.po_type !== 'combined' && !combinedSourcePoNumbers.has(p.po_id) && !IS_PREVIEW_SCHEMA && (
                     <button
                       type="button"
                       onClick={() => handleExportPo(p)}

@@ -66,6 +66,17 @@ export interface PoHeader {
   erp_status: string
   irs_po_no?: string | null
   irs_grn_no?: string | null
+  // 网站开单日期（合并单显式业务字段；缺失时不推断，导出 fail closed）
+  website_po_date?: string | null
+  // 批准快照版本（2 = v2 DB 摘要；旧单为 null，只允许内部 review，不冒充已校验）
+  approval_snapshot_version?: number | null
+  /** 导出时由 verifyApprovedSnapshot 得出的校验状态（仅展示用，不入库） */
+  approval_snapshot_status?: string | null
+  // IRS 编号验证证据：有证据才允许导出编号，否则留空
+  irs_po_no_verified_at?: string | null
+  irs_po_no_verified_by?: string | null
+  irs_grn_no_verified_at?: string | null
+  irs_grn_no_verified_by?: string | null
 }
 
 export interface PoWithLines extends PoHeader {
