@@ -3,8 +3,13 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
   ArrowLeft,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
+  GripVertical,
   Loader2,
+  Lock,
+  Merge,
   Plus,
   Search,
   Trash2,
@@ -16,6 +21,7 @@ import {
   deletePo,
   getPo,
   listPos,
+  reorderLines,
   requestPush,
   searchItems,
   searchSuppliers,
@@ -44,8 +50,33 @@ function fmtDate(iso: string): string {
   return `${dd}/${mm}/${yyyy} ${hh}:${mi}`
 }
 
+/** PO 状态徽章：区分普通单 / 合并单 / 合并占用 / 已合并 */
+function poStatusBadge(status: string, poType: string): { label: string; cls: string } {
+  if (poType === 'combined') {
+    if (status === 'pending_approval') return { label: '合并单·待审批', cls: 'bg-amber-100 text-amber-700' }
+    if (status === 'exported') return { label: '合并单·已导出', cls: 'bg-emerald-100 text-emerald-700' }
+    if (status === 'pending_push') return { label: '合并单·推送中', cls: 'bg-blue-100 text-blue-700' }
+    return { label: '合并单', cls: 'bg-violet-100 text-violet-700' }
+  }
+  switch (status) {
+    case 'exported':
+      return { label: '已导出', cls: 'bg-emerald-100 text-emerald-700' }
+    case 'pending_push':
+      return { label: '推送中…', cls: 'bg-blue-100 text-blue-700' }
+    case 'combining':
+      return { label: '合并中', cls: 'bg-blue-100 text-blue-700' }
+    case 'combined':
+      return { label: '已合并', cls: 'bg-slate-200 text-slate-600' }
+    case 'pending_approval':
+      return { label: '待审批', cls: 'bg-amber-100 text-amber-700' }
+    default:
+      return { label: '未导出', cls: 'bg-amber-100 text-amber-700' }
+  }
+}
+
 interface EditableLine {
   key: string
+  lineId?: string // 已保存行的 uuid id（拖曳排序持久化用）
   item: Item | null
   itemQuery: string
   qty: string
@@ -257,6 +288,8 @@ export default function TjPoSystemPage() {
     <PoList
       onCreate={() => navigate('/tj-po-system/new')}
       onEdit={(id) => navigate(`/tj-po-system/${id}`)}
+      onCombine={(ids) => navigate(`/tj-po-system/combine?ids=${ids.join(',')}`)}
+      onAddItem={() => navigate('/tj-po-system/items')}
     />
   )
 }
@@ -268,14 +301,20 @@ export default function TjPoSystemPage() {
 function PoList({
   onCreate,
   onEdit,
+  onCombine,
+  onAddItem,
 }: {
   onCreate: () => void
   onEdit: (id: string) => void
+  onCombine: (ids: string[]) => void
+  onAddItem: () => void
 }) {
   const [pos, setPos] = useState<PoHeader[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [exportingId, setExportingId] = useState('')
+  const [combineMode, setCombineMode] = useState(false)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     let mounted = true
@@ -308,23 +347,88 @@ function PoList({
     }
   }
 
+  // 合并勾选：只允许 confirmed；强制相同 Supplier Code
+  function toggleSelect(p: PoHeader) {
+    if (selected.has(p.id)) {
+      const next = new Set(selected)
+      next.delete(p.id)
+      setSelected(next)
+      return
+    }
+    const already = pos.find((x) => selected.has(x.id))
+    if (already && already.supplier_code !== p.supplier_code) {
+      setError('只能合并相同 Supplier Code 的采购单')
+      return
+    }
+    const next = new Set(selected)
+    next.add(p.id)
+    setSelected(next)
+    setError('')
+  }
+
+  function handleCombine() {
+    if (selected.size < 2) {
+      setError('请至少勾选两张尚未推送的采购单')
+      return
+    }
+    onCombine(Array.from(selected))
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 px-4 py-6 md:px-8">
       <div className="mx-auto max-w-3xl">
-        <header className="mb-6 flex items-center justify-between">
+        <header className="mb-6 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="text-2xl font-bold leading-tight text-slate-900">采购单</h1>
             <p className="text-sm font-medium text-slate-500">Purchase Order</p>
             <p className="mt-1 text-sm text-slate-500">建立采购单、导出 Excel 交给 PAD 录入 IRS</p>
           </div>
-          <button
-            type="button"
-            onClick={onCreate}
-            className="inline-flex items-center gap-2 whitespace-nowrap rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-emerald-700"
-          >
-            <Plus className="h-4 w-4" /> 新建采购单
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={onAddItem}
+              className="inline-flex items-center gap-2 whitespace-nowrap rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              <Plus className="h-4 w-4" /> 新增商品
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setCombineMode((v) => !v)
+                setSelected(new Set())
+                setError('')
+              }}
+              className={`inline-flex items-center gap-2 whitespace-nowrap rounded-xl border px-3 py-2.5 text-sm font-semibold ${
+                combineMode
+                  ? 'border-emerald-500 bg-emerald-50 text-emerald-700'
+                  : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <Merge className="h-4 w-4" /> 合并采购单
+            </button>
+            <button
+              type="button"
+              onClick={onCreate}
+              className="inline-flex items-center gap-2 whitespace-nowrap rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-emerald-700"
+            >
+              <Plus className="h-4 w-4" /> 新建采购单
+            </button>
+          </div>
         </header>
+
+        {combineMode && (
+          <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+            <span className="text-sm text-emerald-800">合并模式：勾选两张以上相同 Supplier、尚未推送的采购单</span>
+            <button
+              type="button"
+              onClick={handleCombine}
+              disabled={selected.size < 2}
+              className="shrink-0 rounded-lg bg-emerald-600 px-3 py-1.5 text-sm font-semibold text-white disabled:opacity-50"
+            >
+              合并 ({selected.size})
+            </button>
+          </div>
+        )}
 
         {error && (
           <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
@@ -347,44 +451,60 @@ function PoList({
           </div>
         ) : (
           <ul className="space-y-2">
-            {pos.map((p) => (
-              <li key={p.id} className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-4 transition-colors hover:border-emerald-300">
-                <button
-                  type="button"
-                  onClick={() => onEdit(p.id)}
-                  className="min-w-0 flex-1 text-left"
+            {pos.map((p) => {
+              const s = poStatusBadge(p.status, p.po_type)
+              const notCombinable = combineMode && p.status !== 'confirmed'
+              return (
+                <li
+                  key={p.id}
+                  className={`flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-4 transition-colors hover:border-emerald-300 ${
+                    notCombinable ? 'opacity-50' : ''
+                  }`}
                 >
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono text-sm font-semibold text-slate-900">{p.po_id}</span>
-                    {p.created_by && (
-                      <span className="rounded-md bg-violet-100 px-2 py-0.5 text-xs font-bold text-violet-700">[{p.created_by}]</span>
-                    )}
-                    {p.status === 'exported' ? (
-                      <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-700">已导出</span>
-                    ) : p.status === 'pending_push' ? (
-                      <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">推送中…</span>
-                    ) : (
-                      <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">未导出</span>
-                    )}
-                  </div>
-                  <div className="mt-1 truncate text-sm text-slate-700">{p.supplier_name}</div>
-                  <div className="mt-0.5 text-xs text-slate-400">
-                    {p.supplier_code} · {p.line_count ?? 0} 项 · {fmtDate(p.created_at)}
-                  </div>
-                </button>
-                {p.status === 'confirmed' && (
+                  {combineMode && (
+                    <input
+                      type="checkbox"
+                      checked={selected.has(p.id)}
+                      onChange={() => toggleSelect(p)}
+                      disabled={p.status !== 'confirmed'}
+                      className="h-4 w-4 shrink-0 accent-emerald-600 disabled:opacity-30"
+                    />
+                  )}
                   <button
                     type="button"
-                    onClick={() => handleExportPo(p)}
-                    disabled={exportingId === p.id}
-                    className="flex shrink-0 items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+                    onClick={() => (combineMode ? toggleSelect(p) : onEdit(p.id))}
+                    disabled={notCombinable}
+                    className="min-w-0 flex-1 text-left"
                   >
-                    {exportingId === p.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
-                    推送到电脑
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-sm font-semibold text-slate-900">{p.po_id}</span>
+                      {p.created_by && (
+                        <span className="rounded-md bg-violet-100 px-2 py-0.5 text-xs font-bold text-violet-700">[{p.created_by}]</span>
+                      )}
+                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${s.cls}`}>{s.label}</span>
+                    </div>
+                    <div className="mt-1 truncate text-sm text-slate-700">{p.supplier_name}</div>
+                    <div className="mt-0.5 text-xs text-slate-400">
+                      {p.supplier_code} · {p.line_count ?? 0} 项 · {fmtDate(p.created_at)}
+                      {p.source_po_ids && p.source_po_ids.length > 0 && (
+                        <span className="ml-1 text-slate-300">← 来源 {p.source_po_ids.join(', ')}</span>
+                      )}
+                    </div>
                   </button>
-                )}
-              </li>
-            ))}
+                  {!combineMode && p.status === 'confirmed' && (
+                    <button
+                      type="button"
+                      onClick={() => handleExportPo(p)}
+                      disabled={exportingId === p.id}
+                      className="flex shrink-0 items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+                    >
+                      {exportingId === p.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+                      推送到电脑
+                    </button>
+                  )}
+                </li>
+              )
+            })}
           </ul>
         )}
       </div>
@@ -415,8 +535,17 @@ function PoEditor({
   const [savedPoId, setSavedPoId] = useState<string | undefined>(poId)
   const [createdBy, setCreatedBy] = useState<string | null>(null)
   const [showPersonPicker, setShowPersonPicker] = useState(false)
+  const [frozen, setFrozen] = useState(false)
+  const [dragIndex, setDragIndex] = useState<number | null>(null)
+  const [dropIndex, setDropIndex] = useState<number | null>(null)
 
   const lineRefs = useRef<Record<string, { item: HTMLInputElement | null; qty: HTMLInputElement | null; price: HTMLInputElement | null }>>({})
+
+  // 始终指向最新 lines，供拖曳排序读取（避免闭包陈旧）
+  const linesRef = useRef(lines)
+  useEffect(() => {
+    linesRef.current = lines
+  }, [lines])
 
   // 加载已有 PO
   useEffect(() => {
@@ -428,6 +557,7 @@ function PoEditor({
         setLines(
           po.lines.map((l) => ({
             key: nextKey(),
+            lineId: l.id,
             item: { id: '', code: l.item_code, description: l.description, uom: l.uom, cost: l.unit_price, selling_price: null },
             itemQuery: l.item_code,
             qty: String(l.qty),
@@ -435,6 +565,7 @@ function PoEditor({
           }))
         )
         setCreatedBy(po.created_by ?? null)
+        setFrozen(!!po.frozen)
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
@@ -465,6 +596,43 @@ function PoEditor({
 
   function removeLine(key: string) {
     setLines((ls) => (ls.length > 1 ? ls.filter((l) => l.key !== key) : ls))
+  }
+
+  // 拖曳/上移下移排序：更新本地顺序，已保存的 PO 立即持久化 line_no
+  function moveLine(from: number, to: number) {
+    const ls = linesRef.current
+    if (from < 0 || to < 0 || from >= ls.length || to >= ls.length || from === to) return
+    const next = [...ls]
+    const [moved] = next.splice(from, 1)
+    next.splice(to, 0, moved)
+    setLines(next)
+    if (savedPoId && next.every((l) => l.lineId)) {
+      reorderLines(savedPoId, next.map((l) => l.lineId!)).catch((e) =>
+        setError(e.message || '排序保存失败')
+      )
+    }
+  }
+
+  function handleDragStart(index: number) {
+    if (frozen) return
+    setDragIndex(index)
+  }
+
+  function handleDragOver(index: number) {
+    if (dragIndex === null || frozen) return
+    if (index !== dropIndex) setDropIndex(index)
+  }
+
+  function handleDrop(index: number) {
+    if (dragIndex === null || frozen) return
+    moveLine(dragIndex, index)
+    setDragIndex(null)
+    setDropIndex(null)
+  }
+
+  function handleDragEnd() {
+    setDragIndex(null)
+    setDropIndex(null)
   }
 
   // 商品行内选中商品
@@ -628,7 +796,8 @@ function PoEditor({
           </div>
 
           {/* 表头（桌面） */}
-          <div className="hidden grid-cols-[1fr_1.6fr_80px_90px_90px_40px] gap-2 px-2 pb-1 text-xs text-slate-400 md:grid">
+          <div className="hidden grid-cols-[28px_1fr_1.6fr_80px_90px_90px_40px] gap-2 px-2 pb-1 text-xs text-slate-400 md:grid">
+            <span />
             <span>商品编号</span>
             <span>描述</span>
             <span className="text-right">数量</span>
@@ -642,6 +811,10 @@ function PoEditor({
               <LineRow
                 key={l.key}
                 line={l}
+                index={idx}
+                frozen={frozen}
+                dragging={dragIndex === idx}
+                dropTarget={dropIndex === idx && dragIndex !== idx}
                 refs={lineRefs.current[l.key] ?? (lineRefs.current[l.key] = { item: null, qty: null, price: null })}
                 onPickItem={(item) => pickItem(l.key, item)}
                 onChange={(patch) => updateLine(l.key, patch)}
@@ -656,6 +829,12 @@ function PoEditor({
                   }
                 }}
                 canRemove={lines.length > 1}
+                onDragStart={() => handleDragStart(idx)}
+                onDragOver={() => handleDragOver(idx)}
+                onDrop={() => handleDrop(idx)}
+                onDragEnd={handleDragEnd}
+                onMoveUp={() => moveLine(idx, idx - 1)}
+                onMoveDown={() => moveLine(idx, idx + 1)}
               />
             ))}
           </div>
@@ -751,6 +930,10 @@ function PoEditor({
 
 function LineRow({
   line,
+  index,
+  frozen,
+  dragging,
+  dropTarget,
   refs,
   onPickItem,
   onChange,
@@ -758,8 +941,18 @@ function LineRow({
   onQtyEnter,
   onPriceEnter,
   canRemove,
+  onDragStart,
+  onDragOver,
+  onDrop,
+  onDragEnd,
+  onMoveUp,
+  onMoveDown,
 }: {
   line: EditableLine
+  index: number
+  frozen: boolean
+  dragging: boolean
+  dropTarget: boolean
   refs: { item: HTMLInputElement | null; qty: HTMLInputElement | null; price: HTMLInputElement | null }
   onPickItem: (item: Item) => void
   onChange: (patch: Partial<EditableLine>) => void
@@ -767,6 +960,12 @@ function LineRow({
   onQtyEnter: () => void
   onPriceEnter: () => void
   canRemove: boolean
+  onDragStart: () => void
+  onDragOver: () => void
+  onDrop: () => void
+  onDragEnd: () => void
+  onMoveUp: () => void
+  onMoveDown: () => void
 }) {
   const [results, setResults] = useState<Item[]>([])
   const [open, setOpen] = useState(false)
@@ -824,8 +1023,64 @@ function LineRow({
   }
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-3">
-      <div className="grid grid-cols-[1fr_1fr_auto_auto] gap-2 md:grid-cols-[1fr_1.6fr_80px_90px_90px_40px] md:items-center">
+    <div
+      className={`flex rounded-xl border bg-white transition-colors ${
+        dropTarget ? 'border-emerald-400 ring-2 ring-emerald-100' : 'border-slate-200'
+      } ${dragging ? 'opacity-50' : ''}`}
+      onDragOver={(e) => {
+        e.preventDefault()
+        onDragOver()
+      }}
+      onDrop={(e) => {
+        e.preventDefault()
+        onDrop()
+      }}
+    >
+      {/* 左把手栏：拖曳 + 上移/下移 */}
+      <div className="flex w-8 shrink-0 flex-col items-center justify-center gap-1 rounded-l-xl border-r border-slate-100 bg-slate-50 py-2">
+        {frozen ? (
+          <Lock className="h-4 w-4 text-slate-300" aria-label="已批准冻结，不可重新排序" />
+        ) : (
+          <>
+            <button
+              type="button"
+              draggable
+              onDragStart={(e) => {
+                e.dataTransfer.effectAllowed = 'move'
+                onDragStart()
+              }}
+              onDragEnd={onDragEnd}
+              className="cursor-grab rounded p-0.5 text-slate-300 hover:text-slate-500 active:cursor-grabbing"
+              aria-label="拖曳排序"
+              title="拖曳排序"
+            >
+              <GripVertical className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={onMoveUp}
+              disabled={index === 0}
+              className="rounded p-0.5 text-slate-300 hover:bg-slate-100 hover:text-slate-500 disabled:opacity-30"
+              aria-label="上移"
+              title="上移"
+            >
+              <ChevronUp className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={onMoveDown}
+              className="rounded p-0.5 text-slate-300 hover:bg-slate-100 hover:text-slate-500"
+              aria-label="下移"
+              title="下移"
+            >
+              <ChevronDown className="h-3.5 w-3.5" />
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* 商品行 */}
+      <div className="grid flex-1 grid-cols-[1fr_1fr_auto_auto] gap-2 p-3 md:grid-cols-[1fr_1.6fr_80px_90px_90px_40px] md:items-center">
         {/* 商品编号 / 搜索 */}
         <div className="relative col-span-4 md:col-span-1">
           <input

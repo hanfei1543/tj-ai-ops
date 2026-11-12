@@ -6,13 +6,16 @@
 
 ## 1 当前焦点与下一步
 
-- **当前焦点**: VPS/网站侧全部完成并上线——VPS 推送（桥 v3.1 原子写 + cron 每分钟）、商品分词模糊搜索、保存选开单人（created_by）、列表 UI 修复（开单人粗体高亮 + 按钮流式布局不遮挡）。剩用户侧本机 Queue Runner + PAD 无人值守。
+- **当前焦点**: 三新功能（Combined PO 合并采购单 / 商品拖曳排序 / Add New Item）已实现并隔离验收通过（14/14），未部署、未 push、未写 Windows Queue。数据库 schema 增量迁移（additive，见 supabase/migrations/20261112_combined_po.sql）。
 - **下一步**:
-  - 用户侧搭本机 Queue Runner（Task Scheduler + 防重复 + 4 文件夹挪动）。
-  - PAD 无人值守验证（锁屏/登出后 UI 自动化是否可靠）。
-  - 之后做 IRS 端到端：点「推送到电脑」→ Pending → PAD 开 PO → 核实 IRS PO Number 回写。
-  - 修目标机隧道重启命令的 PowerShell 引号 bug（见下方已核实）。
-- **本会话已核实**（2026-11-07）:
+  - 待用户确认后 commit + push main（触发 CF Pages 自动部署）。
+  - Add New Item 的 IRS Item Master 必填字段待 IRS 画面验收后对齐（当前为过渡数据包）。
+  - 用户侧本机 Queue Runner + PAD 无人值守（原业务，仍未做）。
+  - 修目标机隧道重启命令的 PowerShell 引号 bug（原遗留）。
+- **本会话已核实**（2026-11-12）:
+  - `npm run build` 通过；隔离测试 14/14 通过（合并/审批冻结/取消恢复/来源标记/单张 PO 兼容）；po_seq 已重置回接续点，正式 PO 编号无跳号。
+  - 旧单张 PO 建单、导出、推送流程未破坏（createPo/requestPush 语义未改，仅新增 po_type 默认 standard）。
+- **历史已核实**（2026-11-07）:
   - 桥 v3.1 已部署目标机，实测 write：PO_Queue\Pending 成功、非白名单路径拒绝、原子写无 .part 残留。
   - 前端「推送到电脑」+ pending_push「推送中…」+ 每 5 秒轮询刷新，均已上线（CF Pages chunk 已确认）。
   - 推送器 cron（每分钟）已建；手动触发实测 PO-000005 → PO-000005.xlsx 落到目标机 Pending（6735B 合法 Excel），状态 confirmed→pending_push→exported。
@@ -60,18 +63,32 @@
 |---|---|
 | `tj_suppliers` | 供应商（code 唯一，name） |
 | `tj_items` | 商品（code 唯一，description/uom/cost/selling_price） |
-| `tj_po_headers` | PO 表头（po_id 自动 PO-000001 格式，supplier，status=confirmed/pending_push/exported，created_by 开单人） |
-| `tj_po_lines` | PO 明细（item_code，qty，unit_price） |
+| `tj_po_headers` | PO 表头（po_id 自动 PO-000001 格式，supplier，status，created_by 开单人；含合并单字段 po_type/source_po_ids/frozen/po_revision/source_sha256/delivery_order_no/receipt_event_id/checked_by/approved_by/approved_at/received_at/erp_status/irs_po_no/irs_grn_no） |
+| `tj_po_lines` | PO 明细（item_code，qty，unit_price；含排序 line_no、来源追溯 source_po_id/source_line_id/source_refs、original_qty 原订购、accepted_qty 实收批准、note 例外备注） |
 | `tj_po_exports` | 导出历史（防重复导出） |
+| `tj_item_requests` | Add New Item Master 申请（独立流程；status=pending/approved/exported/created/needs_review/rejected） |
 
 - RLS 已启用，anon 可读写（MVP 无登录，后续可收紧）。
 - PO ID 由 identity + trigger（`tj_gen_po_id`）自动生成。
-- 状态机：保存=confirmed（未导出）→ 点推送=pending_push（推送中）→ VPS 推完=exported（已导出）。
+- 状态机（普通单）：保存=confirmed（未导出）→ 点推送=pending_push（推送中）→ VPS 推完=exported（已导出）。
+- 状态机（合并单）：draft（核对调整）→ pending_approval（待审批）→ confirmed(frozen=true)（批准冻结）→ pending_push → exported；来源单在合并待审批期间标 combining（锁定），批准后标 combined（不可再推），取消合并恢复 confirmed。
+- 冻结：frozen=true 的 PO 不允许拖曳重排（除非新建审批修订）。
 
 ### Excel 导出格式（对齐 PAD）
 
 - Worksheet 名 `PO_Lines`；列顺序 Supplier Code / Supplier Name / Item Code / Description / UOM / Qty / Unit Price (RM)。
 - Item Code / Supplier Code = 文本（前导零安全）；Qty / Unit Price = 数值。
+- Qty 取 `accepted_qty ?? qty`（合并单导出实收/批准数量，普通单回退订购 qty）；行序按 `line_no`（= 拖曳排序后的最终批准顺序）。
+- Add New Item Master 独立导出 Worksheet 名 `Item_Master`（Item Code / Barcode / Description / UOM / Category / Supplier Code / Purchase Cost / Selling Price / Tax Rate / SST Info）——IRS 实际必填字段尚未验收，此为过渡数据包。
+
+### 新功能（2026-11-12）
+
+- 路由新增 `/tj-po-system/combine`（合并采购单）与 `/tj-po-system/items`（Add New Item）；页面 `web/src/pages/CombinePoPage.tsx`、`AddItemPage.tsx`。
+- 迁移脚本 `supabase/migrations/20261112_combined_po.sql`（全部 additive）。
+- Combined PO：列表「合并采购单」模式勾选 ≥2 张相同 Supplier 的 confirmed 单 → 合并画面按 item_code+uom+单价合并数量（不同 UOM/单价分开）→ 调实收数量/顺序/例外备注 → 保存并提交审批 → 批准冻结 → 才可推送；来源单标 combined，取消合并恢复。
+- 拖曳排序：普通 PO 与合并画面均支持把手拖曳 + 上移/下移按钮，已保存 PO 立即持久化 line_no；frozen 锁定禁止重排。
+- Add New Item：查重（tj_items + pending 申请）→ 审批 → 导出 Item_Master 数据包 → Windows/PAD 侧核对 IRS 后回写 created/needs_review（不假设 PAD 已自动建 Item Master）。
+- 全部未部署、未 push：改动仅在本地 repo 与数据库 schema（additive），未触发 CF Pages 部署，未写入 Windows Queue。
 
 ### 数据情况
 

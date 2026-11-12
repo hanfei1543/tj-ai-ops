@@ -74,7 +74,7 @@ async function buildXlsx(header, lines) {
       item_code: l.item_code,
       description: l.description,
       uom: l.uom ?? '',
-      qty: Number(l.qty),
+      qty: Number(l.accepted_qty ?? l.qty),
       unit_price: Number(l.unit_price),
     });
   }
