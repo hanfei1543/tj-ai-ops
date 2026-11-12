@@ -88,7 +88,9 @@
 - Combined PO：列表「合并采购单」模式勾选 ≥2 张相同 Supplier 的 confirmed 单 → 合并画面按 item_code+uom+单价合并数量（不同 UOM/单价分开）→ 调实收数量/顺序/例外备注 → 保存并提交审批 → 批准冻结 → 才可推送；来源单标 combined，取消合并恢复。
 - 拖曳排序：普通 PO 与合并画面均支持把手拖曳 + 上移/下移按钮，已保存 PO 立即持久化 line_no；frozen 锁定禁止重排。
 - Add New Item：查重（tj_items + pending 申请）→ 审批 → 导出 Item_Master 数据包 → Windows/PAD 侧核对 IRS 后回写 created/needs_review（不假设 PAD 已自动建 Item Master）。
-- 全部未部署、未 push：改动仅在本地 repo 与数据库 schema（additive），未触发 CF Pages 部署，未写入 Windows Queue。
+- GR 收货数据导出：批准冻结后「导出收货单 (GR)」→ GR_Info（receipt_event_id + DO No + 批准快照 source_sha256）+ GR_Lines（订购 Ordered Qty vs 实收 Accepted Qty + 来源 PO/行追溯 + 例外备注），独立于 PO_Lines。
+- Preview 隔离：单独 schema `tj_preview`（独立 PO 序号/数据，service_role 不授权=生产推送器天然隔离），Preview 环境变量 VITE_SUPABASE_SCHEMA=tj_preview。详见 docs/migration-rollback-20261112.md。
+- 全部未部署 main、未写正式 Windows Queue：改动在 feature/combined-po 分支，Preview 已部署可测。
 
 ### 数据情况
 
