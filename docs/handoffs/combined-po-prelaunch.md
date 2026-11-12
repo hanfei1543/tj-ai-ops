@@ -41,6 +41,10 @@ PO-000009 批准顺序：同一测试货号 00101，UNIT/2.50 订购 5、实收 
 交付内部样本目录：/home/hermes/backups/TJ-AI-Ops/20261112-prelaunch-samples/；推荐 REVIEW_INTERNAL_NOT_FOR_PAD_PO-000009.xlsx 与 REVIEW_INTERNAL_NOT_FOR_PAD_GR_PO-000009.xlsx，均为测试审阅资料。pad-format-internal-only/ 内另保留无审阅页的 PAD 格式验证文件，绝不能放入 Windows Queue。verification.json 保存逐行核对与文件 hash，不入 Git。
 没有 push 任一分支、部署本轮托管 Preview 或生产网站；本轮“Preview 回归”指本地页面 + 真实隔离 schema，不等于旧 Cloudflare Preview 已包含修正。二次独立核心逻辑复核 passed=true／logic_errors=[]，同样实跑 110 项测试，已知未应用 public 迁移、非原子／竞态及严格冻结等风险保留并非生产安全放行。随后按其建议补强来源数量缺失不猜 0 与 Preview 版本列读回断言，再由主脑完整回归全通过；证据自动记录在样本目录 evidence/verification.json。本地提交以 git log 为准，不自动 push 或部署。
 
+### Website 内部 Excel 测试与收货事件防重复（2026-11-12 追加）
+- 收货事件防重复入账已代码化：新增部分唯一索引 `uq_tj_po_headers_receipt_event_id`（`receipt_event_id` 非空时唯一）。public 版 `supabase/migrations/20261112_receipt_event_dedup.sql` 仅 PREPARED 未应用；tj_preview 版 `20261112_receipt_event_dedup_preview.sql` 已通过 Management API 应用并读回，DB 断言 `supabase/tests/20261112_receipt_event_dedup.sql` 通过（重复 receipt_event_id 被唯一索引拒绝、全新 ID 允许、NULL 多行不受限）。
+- Website 内部 Excel 用真实生成器（`scripts/gen_po_excel.mjs --mode formal --po-name/--gr-name`）产出两份文件：`/home/hermes/backups/TJ-AI-Ops/20261112-website-test/WEBSITE_PO_TEST.xlsx`（PO_Lines 8 列 + Website PO Date=2026-11-09，3 行）与 `WEBSITE_GR_TEST.xlsx`（GR_Info + GR_Lines，receipt_event_id / DO / 审批冻结 / 订购实收齐全，irs_po_no / irs_grn_no 空）。`scripts/verify_website_test.mjs` 逐项核对 15/15 通过；114 项测试 + tsc/vite 构建通过。未新增员工前台导出按钮，未推送、未部署。commit `ba5372d`。
+
 ## 阻塞与避坑
 日期缺失的旧冻结样本只能内部审阅，不能冒充可供 PAD 正式导入的样本。IRS 编号必须有独立核对证据，不能因字段里有数字即导出。生产 anon 写权限较宽，数据库护栏未应用前不能声称真实生产端已实现数据库防绕过；本轮生产迁移须另行授权。先完成修正、隔离回归，再提交给用户决定是否上线核心功能；三个冻结继续保持。
 本轮有意保留数据库“已冻结表头整行不可修改”的严格限制，因此批准后也不能后补 IRS 验证编号。这符合当前 GR／IRS 写入停用边界，但不是完整可用的未来过账流程。日后经独立授权开放 GR／IRS 时，需要另行设计受控验证结果写入／独立关联记录，再验收回查、防重复与恢复；不能只把开关改为 true 就称已开放。
