@@ -5,6 +5,7 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Download,
   GripVertical,
   Loader2,
   Plus,
@@ -15,9 +16,11 @@ import {
   cancelCombinedPo,
   createCombinedPo,
   getItemByCode,
+  getPo,
   getPosByIds,
   submitCombinedForApproval,
 } from '@/lib/tjPoApi'
+import { downloadGrExcel } from '@/lib/tjPoExcel'
 import type { PoWithLines, SourceRef } from '@/types/tjPo'
 
 const CREATED_BY_OPTIONS = ['Ms Toh', 'Ngam Cheng Jye', 'Keh Lee', 'Ms Teow', 'Ah Huat']
@@ -284,6 +287,21 @@ export default function CombinePoPage() {
       navigate('/tj-po-system')
     } catch (e: any) {
       setError(e.message || '取消失败')
+      setBusy(false)
+    }
+  }
+
+  // 导出 GR 收货数据包（receipt_event_id + DO No + 批准快照 + 实收明细）
+  async function handleExportGr() {
+    if (!combinedPoId) return
+    setBusy(true)
+    setError('')
+    try {
+      const po = await getPo(combinedPoId)
+      await downloadGrExcel(po, po.lines)
+    } catch (e: any) {
+      setError(e.message || '导出收货单失败')
+    } finally {
       setBusy(false)
     }
   }
@@ -604,13 +622,23 @@ export default function CombinePoPage() {
               </button>
             )}
             {phase === 'confirmed' && (
-              <button
-                type="button"
-                onClick={() => navigate('/tj-po-system')}
-                className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-6 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700"
-              >
-                完成，返回列表
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={handleExportGr}
+                  disabled={busy}
+                  className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm font-semibold text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+                >
+                  <Download className="h-4 w-4" /> 导出收货单 (GR)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigate('/tj-po-system')}
+                  className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-6 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700"
+                >
+                  完成，返回列表
+                </button>
+              </>
             )}
           </div>
         </div>

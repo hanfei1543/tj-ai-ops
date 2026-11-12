@@ -323,18 +323,20 @@ export async function updateCombinedPoLines(id: string, lines: CombinedLineInput
   if (le) throw le
 }
 
-/** 前台确认完成，提交审批：draft -> pending_approval，记录核对人与送货单号 */
+/** 前台确认完成，提交审批：draft -> pending_approval，记录核对人、送货单号、收货事件 ID */
 export async function submitCombinedForApproval(
   id: string,
   checkedBy: string,
   deliveryOrderNo?: string
 ): Promise<void> {
+  const receiptEventId = crypto.randomUUID()
   const { error } = await db
     .from('tj_po_headers')
     .update({
       status: 'pending_approval',
       checked_by: checkedBy,
       delivery_order_no: deliveryOrderNo ?? null,
+      receipt_event_id: receiptEventId,
       received_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })

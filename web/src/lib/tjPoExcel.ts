@@ -119,3 +119,94 @@ export async function downloadItemMasterExcel(items: ItemRequest[]): Promise<str
   URL.revokeObjectURL(url)
   return filename
 }
+
+// ---------------------------------------------------------------------------
+// GR 收货数据导出（独立于 PO Excel）：receipt_event_id + DO No + 批准快照 + 实收明细
+// 供 Windows/PAD 核对收货（IRS Goods Received Note）用，不混入 PO_Lines 导出。
+// ---------------------------------------------------------------------------
+
+/** 生成 GR 收货数据包：Sheet1 GR_Info（收货元数据+批准快照），Sheet2 GR_Lines（实收明细） */
+export async function buildGrWorkbook(po: PoHeader, lines: PoLine[]): Promise<Blob> {
+  const wb = new ExcelJS.Workbook()
+
+  // ---- GR_Info：收货事件元数据 + 批准快照（字段/值 纵向）----
+  const info = wb.addWorksheet('GR_Info')
+  info.columns = [
+    { header: 'Field', key: 'field', width: 24 },
+    { header: 'Value', key: 'value', width: 60 },
+  ]
+  info.getRow(1).font = { bold: true }
+  const rows: [string, string][] = [
+    ['receipt_event_id', po.receipt_event_id ?? ''],
+    ['delivery_order_no', po.delivery_order_no ?? ''],
+    ['po_id', po.po_id],
+    ['po_type', po.po_type],
+    ['po_revision', String(po.po_revision)],
+    ['supplier_code', po.supplier_code],
+    ['supplier_name', po.supplier_name],
+    ['received_at', po.received_at ?? ''],
+    ['checked_by', po.checked_by ?? ''],
+    ['approved_by', po.approved_by ?? ''],
+    ['approved_at', po.approved_at ?? ''],
+    ['source_sha256', po.source_sha256 ?? ''],
+    ['frozen', po.frozen ? 'true' : 'false'],
+    ['erp_status', po.erp_status],
+    ['irs_po_no', po.irs_po_no ?? ''],
+    ['irs_grn_no', po.irs_grn_no ?? ''],
+  ]
+  for (const [f, v] of rows) {
+    info.addRow({ field: f, value: v })
+  }
+
+  // ---- GR_Lines：实收明细（订购 vs 实收 分开保留）----
+  const ws = wb.addWorksheet('GR_Lines')
+  ws.columns = [
+    { header: 'Line No', key: 'line_no', width: 8 },
+    { header: 'Item Code', key: 'item_code', width: 16 },
+    { header: 'Description', key: 'description', width: 46 },
+    { header: 'UOM', key: 'uom', width: 10 },
+    { header: 'Ordered Qty', key: 'ordered_qty', width: 12 },
+    { header: 'Accepted Qty', key: 'accepted_qty', width: 12 },
+    { header: 'Unit Price (RM)', key: 'unit_price', width: 16 },
+    { header: 'Source PO', key: 'source_pos', width: 22 },
+    { header: 'Source Line IDs', key: 'source_line_ids', width: 30 },
+    { header: 'Note', key: 'note', width: 26 },
+  ]
+  ws.getRow(1).font = { bold: true }
+
+  for (const l of lines) {
+    const refs = l.source_refs ?? []
+    ws.addRow({
+      line_no: Number(l.line_no),
+      item_code: l.item_code,
+      description: l.description,
+      uom: l.uom ?? '',
+      ordered_qty: Number(l.original_qty ?? l.qty),
+      accepted_qty: Number(l.accepted_qty ?? l.qty),
+      unit_price: Number(l.unit_price),
+      source_pos: refs.map((r) => r.po_number).join(', '),
+      source_line_ids: refs.map((r) => r.line_id).join(', '),
+      note: l.note ?? '',
+    })
+  }
+
+  const buf = await wb.xlsx.writeBuffer()
+  return new Blob([buf], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  })
+}
+
+/** 触发浏览器下载 GR 收货数据包，文件名 GR_<po_id>.xlsx */
+export async function downloadGrExcel(po: PoHeader, lines: PoLine[]): Promise<string> {
+  const blob = await buildGrWorkbook(po, lines)
+  const filename = `GR_${po.po_id}.xlsx`
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+  return filename
+}
