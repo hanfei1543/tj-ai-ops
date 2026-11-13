@@ -23,6 +23,7 @@ const HDR = {
   frozen: false,
   supplier_code: '4000/A01',
   supplier_name: 'AMFIX',
+  website_po_date: '2026-11-13',
 }
 const LINES = [
   { id: 'l1', line_no: 1, item_code: '0010001000002', description: 'HINGE', uom: 'UNIT', qty: 5, unit_price: 1.25 },

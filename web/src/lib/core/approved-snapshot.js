@@ -153,7 +153,7 @@ export async function verifyApprovedSnapshot({ header, lines } = {}) {
   }
 
   if (h.po_type !== 'combined') {
-    return { ...base, ok: false, status: 'not_combined', reason: '普通采购单没有批准快照（保持原 7 列流程）' }
+    return { ...base, ok: false, status: 'not_combined', reason: '普通采购单不参与批准快照（列格式见 po-lines standard 8 列）' }
   }
   if (version === null) {
     return {

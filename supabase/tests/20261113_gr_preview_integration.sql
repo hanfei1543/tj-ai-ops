@@ -1310,6 +1310,7 @@ begin
   v_data := jsonb_build_object(
     'id', v_po, 'request_id', v_req,
     'supplier_code', '4000/A01', 'supplier_name', 'AMFIX',
+    'website_po_date', '2026-11-09',
     'notes', 'call supplier before 3pm', 'created_by', 'Ah Huat',
     'lines', jsonb_build_array(
       jsonb_build_object('id', '20000000-0000-4000-8000-000000000003', 'line_no', 1,
@@ -1345,6 +1346,7 @@ begin
   perform pg_temp.gr_expect_error(
     format('select tj_preview.tj_gr_api(%L, %L::jsonb)', 'po_save',
       jsonb_build_object('id', '10000000-0000-4000-8000-000000000005', 'request_id', 'req-po-frozen',
+        'website_po_date', '2026-11-09',
         'supplier_code', '4000/A01', 'notes', 'x', 'lines', '[]'::jsonb)::text),
     'GR_STATE', '冻结 PO 禁止 po_save');
 
@@ -1360,6 +1362,7 @@ begin
   -- 清掉临时新增的未引用行，恢复 PO3 单行（供 combine 全量覆盖断言）
   execute format('select tj_preview.tj_gr_api(%L, %L::jsonb)', 'po_save',
     jsonb_build_object('id', v_po, 'request_id', 'req-po-save-clean',
+      'website_po_date', '2026-11-09',
       'supplier_code', '4000/A01',
       'lines', jsonb_build_array(
         jsonb_build_object('id', '20000000-0000-4000-8000-000000000003', 'line_no', 1,
@@ -1384,6 +1387,7 @@ begin
   v_data := jsonb_build_object(
     'id', v_po, 'request_id', 'req-po9-1',
     'supplier_code', '4000/A01', 'supplier_name', 'AMFIX',
+    'website_po_date', '2026-11-09',
     'lines', jsonb_build_array(
       jsonb_build_object('line_no', 1, 'item_code', '00901', 'description', 'WASHER',
                          'uom', 'UNIT', 'qty', '4', 'unit_price', '2.00'),
@@ -1404,6 +1408,33 @@ end
 $posave2$;
 reset role;
 
+-- po_save 新日期必填规则真实回归（20261114 migration）：缺日期/非法格式都 GR_VALIDATION
+set local role authenticated;
+set local request.jwt.claim.sub = 'a0000000-0000-4000-8000-000000000002';
+do $posave_date_required$
+begin
+  -- 缺 website_po_date → GR_VALIDATION（不默认当天，不推断时间戳）
+  perform pg_temp.gr_expect_error(
+    format('select tj_preview.tj_gr_api(%L, %L::jsonb)', 'po_save',
+      jsonb_build_object('id', '10000000-0000-4000-8000-000000000009', 'request_id', 'req-po9-nodate',
+        'supplier_code', '4000/A01',
+        'lines', jsonb_build_array(
+          jsonb_build_object('line_no', 1, 'item_code', '00901', 'description', 'WASHER',
+                             'uom', 'UNIT', 'qty', '1', 'unit_price', '2.00')))::text),
+    'GR_VALIDATION', 'po_save 缺 website_po_date 必须拒绝');
+
+  -- 非法格式（非 yyyy-MM-dd）→ GR_VALIDATION
+  perform pg_temp.gr_expect_error(
+    format('select tj_preview.tj_gr_api(%L, %L::jsonb)', 'po_save',
+      jsonb_build_object('id', '10000000-0000-4000-8000-000000000009', 'request_id', 'req-po9-baddate',
+        'website_po_date', '11/13/2026',
+        'supplier_code', '4000/A01',
+        'lines', '[]'::jsonb)::text),
+    'GR_VALIDATION', 'po_save 非法日期格式必须拒绝');
+end
+$posave_date_required$;
+reset role;
+
 -- 引用保护 + FK RESTRICT
 set local role authenticated;
 set local request.jwt.claim.sub = 'a0000000-0000-4000-8000-000000000002';
@@ -1412,6 +1443,7 @@ begin
   perform pg_temp.gr_expect_error(
     format('select tj_preview.tj_gr_api(%L, %L::jsonb)', 'po_save',
       jsonb_build_object('id', '10000000-0000-4000-8000-000000000001', 'request_id', 'req-po-ref-1',
+        'website_po_date', '2026-11-09',
         'supplier_code', '4000/A01',
         'lines', jsonb_build_array(
           jsonb_build_object('id', '20000000-0000-4000-8000-000000000001', 'line_no', 1,
@@ -1422,6 +1454,7 @@ begin
   perform pg_temp.gr_expect_error(
     format('select tj_preview.tj_gr_api(%L, %L::jsonb)', 'po_save',
       jsonb_build_object('id', '10000000-0000-4000-8000-000000000001', 'request_id', 'req-po-ref-2',
+        'website_po_date', '2026-11-09',
         'supplier_code', '4000/A01', 'lines', '[]'::jsonb)::text),
     'GR_STATE', '被引用明细不得删除');
 end

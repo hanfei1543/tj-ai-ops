@@ -19,6 +19,7 @@ const STD = {
   frozen: false,
   supplier_code: '4000/A01',
   supplier_name: 'AMFIX',
+  website_po_date: '2026-11-13', // TEST ONLY
 }
 const SRC = {
   id: 'uuid-1',
@@ -28,6 +29,7 @@ const SRC = {
   frozen: false,
   supplier_code: '4000/A01',
   supplier_name: 'AMFIX',
+  website_po_date: '2026-11-13', // TEST ONLY
 }
 const LINES = [
   { id: 'l1', line_no: 1, item_code: '0030000000003', description: 'SCREW', uom: 'UNIT', qty: 5, unit_price: 2.5 },

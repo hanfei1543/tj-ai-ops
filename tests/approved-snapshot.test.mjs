@@ -277,7 +277,7 @@ test('numeric 以字符串返回时摘要不变（PostgREST numeric 兼容，不
   )
 })
 
-test('普通单不参与批准快照（not_combined，保持原 7 列流程）', async () => {
+test('普通单不参与批准快照（not_combined；列格式由 po-lines standard 8 列定义）', async () => {
   const v = await verifyApprovedSnapshot({ header: { ...HEADER, po_type: 'standard' }, lines: LINES })
   assert.equal(v.ok, false)
   assert.equal(v.status, 'not_combined')

@@ -12,7 +12,7 @@
 //   * 批准快照 v2：formal 模式必须通过 DB 数据重算校验；缺 approval_snapshot_version
 //     的旧单只能出 review 样本（明确标注未校验），不冒充已校验批准快照。
 //   * 输出到 scratch（默认 ~/.hermes/cache/scratch/tj_samples），不写 /tmp。
-//   * 普通单仍按 7 列（PAD 口径）；合并单 8 列（含 Website PO Date）。
+//   * 普通单 8 列（原 7 列 + Website PO Date）；合并单 8 列（含 Website PO Date）。
 import path from 'node:path'
 import {
   createPreviewRest,

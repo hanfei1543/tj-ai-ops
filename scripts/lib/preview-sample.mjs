@@ -125,8 +125,13 @@ export async function generatePreviewSample({
       `tj_po_lines?select=*&po_header_id=eq.${header.id}&order=line_no`,
     )
     const isCombined = header.po_type === 'combined'
+    // 普通单：formal 走 STANDARD（8 列 + 严格日期，缺日期 fail closed）；
+    // review 走内部 REVIEW（8 列、日期可空、带 INTERNAL NOT FOR PAD），
+    // 两者都不使用 legacy 7 列（legacy 只能由非 PAD 历史工具显式请求）。
     const exportMode = !isCombined
-      ? EXPORT_MODE_STANDARD
+      ? mode === 'formal'
+        ? EXPORT_MODE_STANDARD
+        : EXPORT_MODE_REVIEW
       : mode === 'formal'
         ? EXPORT_MODE_COMBINED
         : EXPORT_MODE_REVIEW
@@ -138,9 +143,11 @@ export async function generatePreviewSample({
 
     const reviewReasons = []
     if (poExport.warnings.includes('MISSING_WEBSITE_PO_DATE')) {
-      reviewReasons.push('MISSING_WEBSITE_PO_DATE（合并单无 Website PO Date）')
+      reviewReasons.push('MISSING_WEBSITE_PO_DATE（无 Website PO Date）')
     }
-    if (!isCombined) reviewReasons.push('STANDARD_PO_SAMPLE（普通单 7 列 PAD 口径）')
+    if (!isCombined) {
+      reviewReasons.push('STANDARD_PO_SAMPLE（普通单 8 列 PAD 口径，含 Website PO Date）')
+    }
 
     // 批准快照（v2）：由 DB 读回的 header + lines 重算。
     //   formal：必须 verified，否则拒绝（缺 version 的旧单不能冒充已校验批准快照）

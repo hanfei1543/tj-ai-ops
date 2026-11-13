@@ -5,7 +5,7 @@
 // 本文件只做装配：读 env、建 REST/bridge 访问器、跑一轮或循环。
 //
 // 永久安全边界（见 core）：合并单与合并来源单拒绝推送；只走 public schema；
-// 普通 standard 单保持原路径（7 列 PO_Lines -> bridge -> exported）。
+// 普通 standard 单保持原路径（8 列 PO_Lines，含 Website PO Date -> bridge -> exported）。
 import { pathToFileURL } from 'node:url'
 import {
   createSupabaseRest,

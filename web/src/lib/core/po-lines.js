@@ -12,12 +12,16 @@
 //       GR Ordered Qty=订购 两个口径不一致。）
 //   * Item Code / Supplier Code 保持原字符串（前导零安全），不 trim、不改大小写。
 //   * UOM / Unit Price 原样输出，不做单位换算、不做价格重算。
-//   * 普通单（standard）固定 7 列，与 PAD 现有导入完全一致，不追加日期列。
-//   * 合并单（combined）固定 8 列，第 8 列 Website PO Date (yyyy-MM-dd)。
-//     合并单没有既定业务日期，绝不从 created_at/received_at/approved_at 推断；
-//     缺失即 fail closed（抛 PoExportError），由人工补录。
+//   * 普通单（standard）/ 合并单（combined）固定 8 列：原 7 列顺序不变，
+//     第 8 列 Website PO Date (yyyy-MM-dd)。
+//     日期必须是开单/核对人显式选择的业务日期，绝不从
+//     created_at/received_at/approved_at 推断，也不默认当天；
+//     缺失或非法即 fail closed（抛 PoExportError），由人工补录。
+//   * legacy-standard：仅显式请求时导出旧 7 列，只用于非 PAD 的历史兼容
+//     （旧文件重放/内部比对）。standard/combined 永不自动回退到它。
+//   * review：8 列，仅供内部审阅样本（必须带 INTERNAL NOT FOR PAD 标识），日期可空。
 
-/** 普通单 / PAD 兼容的 7 列（顺序即列顺序，勿动） */
+/** 行基础 7 列（legacy-standard 专用；standard/combined/review 在其后追加日期列） */
 export const PO_LINE_BASE_COLUMNS = Object.freeze([
   { header: 'Supplier Code', key: 'supplier_code', width: 16 },
   { header: 'Supplier Name', key: 'supplier_name', width: 38 },
@@ -36,17 +40,23 @@ export const PO_LINE_COLUMNS_WITH_DATE = Object.freeze([
   { header: WEBSITE_PO_DATE_HEADER, key: 'website_po_date', width: 14 },
 ])
 
-/** standard: 7 列，绝不追加日期列（保普通 push 不变） */
+/** standard: 8 列（7 列 + Website PO Date），日期必填；PAD/推送正式口径 */
 export const EXPORT_MODE_STANDARD = 'standard'
 /** combined: 8 列，日期必填，缺失 fail closed */
 export const EXPORT_MODE_COMBINED = 'combined'
 /** review: 8 列，日期可空，仅供内部审阅样本（必须带 INTERNAL NOT FOR PAD 标识） */
 export const EXPORT_MODE_REVIEW = 'review'
+/**
+ * legacy-standard: 旧 7 列（无日期），仅显式用于非 PAD 历史兼容。
+ * 不允许作为 standard 的缺日期回退，pusher/网页导出不得使用。
+ */
+export const EXPORT_MODE_LEGACY_STANDARD = 'legacy-standard'
 
 export const EXPORT_MODES = Object.freeze([
   EXPORT_MODE_STANDARD,
   EXPORT_MODE_COMBINED,
   EXPORT_MODE_REVIEW,
+  EXPORT_MODE_LEGACY_STANDARD,
 ])
 
 /** 导出规则错误：code 供调用方/测试断言，message 直接给操作员看 */
@@ -95,8 +105,12 @@ export function formatWebsitePoDate(value) {
 
 /** 按导出模式返回列定义（返回副本，避免调用方改到冻结常量） */
 export function poLineColumns(mode = EXPORT_MODE_STANDARD) {
-  if (mode === EXPORT_MODE_STANDARD) return PO_LINE_BASE_COLUMNS.map((c) => ({ ...c }))
-  if (mode === EXPORT_MODE_COMBINED || mode === EXPORT_MODE_REVIEW) {
+  if (mode === EXPORT_MODE_LEGACY_STANDARD) return PO_LINE_BASE_COLUMNS.map((c) => ({ ...c }))
+  if (
+    mode === EXPORT_MODE_STANDARD ||
+    mode === EXPORT_MODE_COMBINED ||
+    mode === EXPORT_MODE_REVIEW
+  ) {
     return PO_LINE_COLUMNS_WITH_DATE.map((c) => ({ ...c }))
   }
   throw new PoExportError('INVALID_EXPORT_MODE', `未知导出模式：${mode}`)
@@ -115,19 +129,42 @@ export function buildPoLineRows(header, lines, options = {}) {
   if (!EXPORT_MODES.includes(mode)) {
     throw new PoExportError('INVALID_EXPORT_MODE', `未知导出模式：${mode}`)
   }
-  const withDate = mode !== EXPORT_MODE_STANDARD
   const h = header ?? {}
+  // 单据类型与导出模式必须自洽：合并单不能用 standard/legacy 7 列绕过审批流，
+  // 普通单也不能冒充 combined（review 仅内部样本，允许两边）。
+  const isCombinedHeader = h.po_type === 'combined'
+  if (isCombinedHeader && mode !== EXPORT_MODE_COMBINED && mode !== EXPORT_MODE_REVIEW) {
+    throw new PoExportError(
+      'PO_TYPE_MODE_MISMATCH',
+      `合并单 ${h.po_id ?? '(unknown)'} 只能按 combined（正式）或 review（内部样本）导出，拒绝模式 ${mode}。`,
+    )
+  }
+  if (!isCombinedHeader && mode === EXPORT_MODE_COMBINED) {
+    throw new PoExportError(
+      'PO_TYPE_MODE_MISMATCH',
+      `普通单 ${h.po_id ?? '(unknown)'} 不能按 combined 模式导出（po_type=${h.po_type ?? '(空)'}）。`,
+    )
+  }
+  // legacy-standard 是唯一不带日期列的模式，且必须由调用方显式指定。
+  const withDate = mode !== EXPORT_MODE_LEGACY_STANDARD
   const websitePoDate = withDate ? formatWebsitePoDate(h.website_po_date) : null
 
-  // 合并单：日期是显式业务字段，缺失时拒绝导出（绝不回退 created_at / received_at / approved_at）
-  if (mode === EXPORT_MODE_COMBINED && !websitePoDate) {
+  // standard / combined：日期是显式业务字段，缺失时拒绝导出
+  // （绝不回退 created_at / received_at / approved_at，也绝不自动改用 legacy 7 列）。
+  if (withDate && !websitePoDate && mode !== EXPORT_MODE_REVIEW) {
+    const label = mode === EXPORT_MODE_COMBINED ? '合并单' : '普通单'
     throw new PoExportError(
       'MISSING_WEBSITE_PO_DATE',
-      `合并单 ${h.po_id ?? '(unknown)'} 缺少 Website PO Date（website_po_date 为空），拒绝导出。请先补录日期，系统不会用创建/收货/审批时间代替。`,
+      `${label} ${h.po_id ?? '(unknown)'} 缺少 Website PO Date（website_po_date 为空），拒绝导出。请先补录日期，系统不会用创建/收货/审批时间代替，也不会退回旧 7 列格式。`,
     )
   }
 
   const warnings = []
+  // legacy 7 列仅供非 PAD 历史兼容：调用方必须包 INTERNAL NOT FOR PAD 标识
+  // （7 列 PO_Lines 本身不变），并且不得进入 pusher / PAD 队列。
+  if (mode === EXPORT_MODE_LEGACY_STANDARD) {
+    warnings.push('LEGACY_STANDARD_INTERNAL_NOT_FOR_PAD')
+  }
   if (withDate && !websitePoDate) warnings.push('MISSING_WEBSITE_PO_DATE')
 
   const list = Array.isArray(lines) ? lines : []

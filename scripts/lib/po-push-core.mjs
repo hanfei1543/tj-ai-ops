@@ -6,7 +6,8 @@
 //   * 合并单的来源单不推送——必须查来源关系（source_po_ids），不能只看 status。
 //     来源判定用「针对当前 po_id 的服务端 array contains + limit 1」定向查询，
 //     不拉全量合并单（全量第一页会漏掉分页之外的引用），且拒绝发生在 bridge 之前。
-//   * 普通 standard 单保持原路径：pending_push -> 生成 7 列 PO_Lines -> bridge write -> exported。
+//   * 普通 standard 单保持原路径：pending_push -> 生成 8 列 PO_Lines（含 Website PO Date）-> bridge write -> exported。
+//     Website PO Date 必须是显式业务日期；缺失/非法即 fail closed，绝不退回旧 7 列。
 //   * 显式 public schema（Accept-Profile / Content-Profile: public），避免被 PostgREST
 //     默认 schema 或环境变量悄悄切到预览库。
 //   * GR 正式 push/post 不在此实现，永远不启用。
@@ -289,7 +290,7 @@ export function createPusher({
     return error
   }
 
-  /** PAD 格式生成器：普通单 7 列；合并单内部验证 8 列（不解除 pushOne 的冻结）。 */
+  /** PAD 格式生成器：普通单 8 列（含 Website PO Date）；合并单内部验证 8 列（不解除 pushOne 的冻结）。 */
   async function buildXlsx(header, lines) {
     const combined = header?.po_type === 'combined'
     if (combined) await assertVerifiedApprovedSnapshot(header, lines)

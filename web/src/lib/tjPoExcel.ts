@@ -2,8 +2,10 @@
 import type { ItemRequest, PoHeader, PoLine } from '@/types/tjPo'
 import {
   buildPoLineRows,
-  EXPORT_MODE_COMBINED,
+  EXPORT_MODE_LEGACY_STANDARD,
+  EXPORT_MODE_REVIEW,
   EXPORT_MODE_STANDARD,
+  PoExportError,
   type PoExportMode,
 } from './core/po-lines.js'
 import { assertVerifiedApprovedSnapshot } from './core/approved-snapshot.js'
@@ -17,21 +19,31 @@ import { buildWorkbook } from './core/xlsx.js'
 
 /**
  * 生成 PO Excel（Blob），worksheet 固定名 PO_Lines。
- *   standard（默认）：7 列，与 PAD 现有导入完全一致，绝不追加日期列。
+ *   standard（默认）：8 列（原 7 列 + Website PO Date），日期缺失/非法即 fail closed。
+ *             legacy-standard（旧 7 列）只能显式用于非 PAD 历史兼容，网页导出拒绝。
  *   combined：8 列（+ Website PO Date yyyy-MM-dd）；website_po_date 缺失时抛
  *             PoExportError(MISSING_WEBSITE_PO_DATE)，不会用创建/收货/审批时间代替。
  *             并且必须先通过 v2 批准快照校验（重算 DB 数据摘要 != source_sha256 即拒绝）。
  *   review：8 列但日期可空 —— 仅内部审阅样本用（必须另加 INTERNAL NOT FOR PAD 标识）。
- * Qty 取 accepted_qty ?? qty；行序、code、uom、单价原样保留。
+ * Qty = original_qty ?? qty（订购数量，不接受 accepted_qty 顶替）；行序、code、uom、单价原样保留。
  */
 export async function buildPoWorkbook(
   po: PoHeader,
   lines: PoLine[],
   mode: PoExportMode = EXPORT_MODE_STANDARD
 ): Promise<Blob> {
+  // legacy 7 列只允许历史兼容工具显式请求；网页正式导出不存在这条路径
+  // （也不能作为缺日期时的回退，缺日期必须由 buildPoLineRows 直接 fail closed）。
+  if (mode === EXPORT_MODE_LEGACY_STANDARD) {
+    throw new PoExportError(
+      'LEGACY_MODE_NOT_ALLOWED',
+      'legacy-standard（旧 7 列）仅供非 PAD 历史兼容，网页导出禁止使用；普通单必须带 Website PO Date。'
+    )
+  }
   const { columns, rows } = buildPoLineRows(po, lines, { mode })
-  // 正式合并单导出：批准快照双校验（读失败/摘要不符 → 抛错，不产出文件）
-  if (mode === EXPORT_MODE_COMBINED) {
+  // 合并单的正式导出必须过 v2 批准快照校验 —— 按 DB 的 po_type 判定，
+  // 不能靠调用方换 mode 绕过（review 是内部审阅样本，不冒充正式导出）。
+  if (po.po_type === 'combined' && mode !== EXPORT_MODE_REVIEW) {
     await assertVerifiedApprovedSnapshot(po, lines)
   }
   return buildWorkbook([{ name: 'PO_Lines', columns, rows }])

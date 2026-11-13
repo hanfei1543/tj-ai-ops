@@ -37,6 +37,8 @@ const HDR_STANDARD = {
   frozen: false,
   supplier_code: '4000/A01',
   supplier_name: 'AMFIX',
+  // TEST ONLY：固定测试日期（不是业务默认值）
+  website_po_date: '2026-11-13',
 }
 const LINES_STANDARD = [
   { id: 'l1', line_no: 1, item_code: '0010001000002', description: 'HINGE', uom: 'UNIT', qty: 5, unit_price: 1.25 },
@@ -190,7 +192,7 @@ test('所有 Supabase 请求都显式指定 public schema', async () => {
   }
 })
 
-test('普通单 PO_Lines 仍是原 7 列（不含 Website PO Date）', async () => {
+test('普通单 PO_Lines 为 8 列：原 7 列 + 末尾 Website PO Date', async () => {
   const { pusher, br } = buildPusher({
     pending: [HDR_STANDARD],
     combined: [],
@@ -211,12 +213,29 @@ test('普通单 PO_Lines 仍是原 7 列（不含 Website PO Date）', async () 
     'UOM',
     'Qty',
     'Unit Price (RM)',
+    'Website PO Date',
   ])
   const r2 = ws.getRow(2).values.slice(1)
   assert.equal(r2[2], '0010001000002') // 前导零保留
   assert.equal(r2[5], 5)
   assert.equal(r2[6], 1.25)
+  assert.equal(r2[7], '2026-11-13')
   assert.equal(ws.rowCount, 3)
+})
+
+test('普通单缺日期：推送器 fail closed（不生成 legacy 7 列、bridge 零调用）', async () => {
+  const { pusher, sb, br } = buildPusher({
+    pending: [{ ...HDR_STANDARD, website_po_date: null }],
+    combined: [],
+    linesByHeaderId: { 'uuid-5': LINES_STANDARD },
+  }, { ok: true })
+  const summary = await pusher.runOnce()
+  assert.equal(br.calls.length, 0, '缺日期不得写 bridge')
+  assert.equal(summary.pushed.length, 0)
+  assert.equal(summary.failed.length, 1)
+  assert.match(summary.failed[0].error, /Website PO Date/)
+  assert.equal(sb.calls.filter((c) => c.method === 'POST').length, 0)
+  assert.equal(sb.calls.filter((c) => c.method === 'PATCH').length, 0)
 })
 
 test('bridge 返回 ok:false：标记 delivery_uncertain、停止轮询，不写导出记录', async () => {

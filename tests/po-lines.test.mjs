@@ -5,6 +5,7 @@ import {
   PO_LINE_BASE_COLUMNS,
   buildPoLineRows,
   formatWebsitePoDate,
+  poLineColumns,
   PoExportError,
 } from '../web/src/lib/core/po-lines.js'
 
@@ -25,22 +26,150 @@ const LINES = [
   { item_code: '0020002000002', description: 'PLATE 2', uom: 'PCS', qty: 7, unit_price: 0.9 },
 ]
 
-test('普通单固定 7 列，与原 PAD 列顺序完全一致且不追加日期列', () => {
-  const out = buildPoLineRows(HEADER_STD, LINES, { mode: 'standard' })
+test('普通单固定 8 列：原 7 列顺序不变，末尾追加 Website PO Date', () => {
+  const out = buildPoLineRows({ ...HEADER_STD, website_po_date: '2026-11-13' }, LINES, {
+    mode: 'standard',
+  })
   assert.deepEqual(
     out.columns.map((c) => c.header),
-    ['Supplier Code', 'Supplier Name', 'Item Code', 'Description', 'UOM', 'Qty', 'Unit Price (RM)'],
+    [
+      'Supplier Code',
+      'Supplier Name',
+      'Item Code',
+      'Description',
+      'UOM',
+      'Qty',
+      'Unit Price (RM)',
+      'Website PO Date',
+    ],
   )
+  assert.equal(out.columns.length, 8)
+  // 前 7 列与旧 PAD 口径完全一致（顺序/表头不动）
+  assert.deepEqual(
+    out.columns.slice(0, 7).map((c) => c.header),
+    PO_LINE_BASE_COLUMNS.map((c) => c.header),
+  )
+  assert.deepEqual(out.rows.map((r) => r.website_po_date), [
+    '2026-11-13',
+    '2026-11-13',
+    '2026-11-13',
+  ])
+})
+
+test('普通单缺日期 fail closed：不退回 7 列，也不用 created/approved 时间顶替', () => {
+  for (const v of [undefined, null, '', '   ']) {
+    assert.throws(
+      () => buildPoLineRows({ ...HEADER_STD, website_po_date: v }, LINES, { mode: 'standard' }),
+      (e) => e instanceof PoExportError && e.code === 'MISSING_WEBSITE_PO_DATE',
+      `value=${JSON.stringify(v)}`,
+    )
+  }
+  // 显式回归：header 里明明有 created_at/received_at/approved_at，也不得拿来充数
+  assert.throws(
+    () =>
+      buildPoLineRows(
+        {
+          ...HEADER_STD,
+          created_at: '2026-11-01T03:04:05.000Z',
+          received_at: '2026-11-02T03:04:05.000Z',
+          approved_at: '2026-11-03T03:04:05.000Z',
+        },
+        LINES,
+        { mode: 'standard' },
+      ),
+    (e) => e.code === 'MISSING_WEBSITE_PO_DATE',
+  )
+})
+
+test('普通单非法日期 fail closed（不猜时区/格式）', () => {
+  for (const bad of ['13/11/2026', '2026-11-13T00:00:00Z', '2026-02-30']) {
+    assert.throws(
+      () => buildPoLineRows({ ...HEADER_STD, website_po_date: bad }, LINES, { mode: 'standard' }),
+      (e) => e.code === 'INVALID_WEBSITE_PO_DATE',
+      `bad=${bad}`,
+    )
+  }
+})
+
+test('legacy-standard：仅显式请求时导出旧 7 列（非 PAD 历史兼容），缺日期也不影响', () => {
+  const out = buildPoLineRows(HEADER_STD, LINES, { mode: 'legacy-standard' })
   assert.equal(out.columns.length, 7)
   assert.deepEqual(
     out.columns.map((c) => c.header),
     PO_LINE_BASE_COLUMNS.map((c) => c.header),
   )
   for (const row of out.rows) assert.equal('website_po_date' in row, false)
+  assert.equal(out.websitePoDate, null)
+  // 必须带内部告警，调用方据此加 INTERNAL NOT FOR PAD 包装（7 列本身不变）
+  assert.deepEqual(out.warnings, ['LEGACY_STANDARD_INTERNAL_NOT_FOR_PAD'])
+
+  // 有日期也不会混入第 8 列
+  const withDate = buildPoLineRows(
+    { ...HEADER_STD, website_po_date: '2026-11-13' },
+    LINES,
+    { mode: 'legacy-standard' },
+  )
+  assert.equal(withDate.columns.length, 7)
+  assert.equal('website_po_date' in withDate.rows[0], false)
+})
+
+test('合并单不得用 standard / legacy 7 列绕过审批（po_type 与 mode 必须自洽）', () => {
+  for (const mode of ['standard', 'legacy-standard']) {
+    assert.throws(
+      () =>
+        buildPoLineRows(
+          { ...HEADER_COMBINED, website_po_date: '2026-11-12' },
+          LINES,
+          { mode },
+        ),
+      (e) => e.code === 'PO_TYPE_MODE_MISMATCH',
+      `mode=${mode}`,
+    )
+  }
+  // review 是内部样本，允许合并单使用；正式 combined 仍正常
+  const review = buildPoLineRows(
+    { ...HEADER_COMBINED, website_po_date: '2026-11-12' },
+    LINES,
+    { mode: 'review' },
+  )
+  assert.equal(review.columns.length, 8)
+  const combined = buildPoLineRows(
+    { ...HEADER_COMBINED, website_po_date: '2026-11-12' },
+    LINES,
+    { mode: 'combined' },
+  )
+  assert.equal(combined.websitePoDate, '2026-11-12')
+})
+
+test('普通单不得冒充 combined 模式（避免绕过批准快照/合并语义）', () => {
+  assert.throws(
+    () => buildPoLineRows({ ...HEADER_STD, website_po_date: '2026-11-13' }, LINES, { mode: 'combined' }),
+    (e) => e.code === 'PO_TYPE_MODE_MISMATCH',
+  )
+})
+
+test('默认模式仍是 standard（8 列严格日期），不会静默回退 legacy', () => {
+  const out = buildPoLineRows({ ...HEADER_STD, website_po_date: '2026-11-13' }, LINES)
+  assert.equal(out.mode, 'standard')
+  assert.equal(out.columns.length, 8)
+  assert.throws(
+    () => buildPoLineRows(HEADER_STD, LINES),
+    (e) => e.code === 'MISSING_WEBSITE_PO_DATE',
+  )
+})
+
+test('列定义：standard/combined/review 为 8 列，legacy-standard 为 7 列', () => {
+  assert.equal(poLineColumns('standard').length, 8)
+  assert.equal(poLineColumns('combined').length, 8)
+  assert.equal(poLineColumns('review').length, 8)
+  assert.equal(poLineColumns('legacy-standard').length, 7)
+  assert.equal(poLineColumns().length, 8)
 })
 
 test('普通单行序 / code / uom / price 忠实保留，不排序不换算', () => {
-  const out = buildPoLineRows(HEADER_STD, LINES, { mode: 'standard' })
+  const out = buildPoLineRows({ ...HEADER_STD, website_po_date: '2026-11-13' }, LINES, {
+    mode: 'standard',
+  })
   assert.deepEqual(out.rows.map((r) => r.item_code), [
     '0030000000003',
     '0010001000002',
@@ -63,7 +192,7 @@ test('Qty = original_qty ?? qty：合并单取订购数量，绝不用实收数�
 
 test('original_qty = 0 是有效订购值，不被 ?? 回退成 qty', () => {
   const out = buildPoLineRows(
-    HEADER_STD,
+    { ...HEADER_STD, website_po_date: '2026-11-13' },
     [{ item_code: 'X1', description: 'D', uom: null, qty: 9, original_qty: 0, unit_price: 1 }],
     { mode: 'standard' },
   )
@@ -122,12 +251,13 @@ test('审阅模式（review）：8 列 + 空日期 + 告警，仅内部样本', 
 })
 
 test('数量/单价非数值时拒绝，不写 NaN 进 PAD 文件', () => {
+  const header = { ...HEADER_STD, website_po_date: '2026-11-13' }
   assert.throws(
-    () => buildPoLineRows(HEADER_STD, [{ item_code: 'X', description: 'D', qty: 'abc', unit_price: 1 }]),
+    () => buildPoLineRows(header, [{ item_code: 'X', description: 'D', qty: 'abc', unit_price: 1 }]),
     (e) => e.code === 'INVALID_LINE_QTY',
   )
   assert.throws(
-    () => buildPoLineRows(HEADER_STD, [{ item_code: 'X', description: 'D', qty: 1, unit_price: null }]),
+    () => buildPoLineRows(header, [{ item_code: 'X', description: 'D', qty: 1, unit_price: null }]),
     (e) => e.code === 'INVALID_LINE_PRICE',
   )
 })

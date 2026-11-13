@@ -432,10 +432,21 @@ export async function requestPush(id: string): Promise<void> {
   }
   const { data: hdr, error: he } = await db
     .from('tj_po_headers')
-    .select('po_id, po_type, status, frozen')
+    .select('po_id, po_type, status, frozen, website_po_date')
     .eq('id', id)
     .single()
-  if (he) throw he
+  if (he) {
+    // public 尚未应用迁移时，连日期列都读不到：任何推送都必须阻止（不退回 7 列）
+    if (
+      (he as { code?: string }).code === '42703' ||
+      /website_po_date/.test((he as { message?: string }).message ?? '')
+    ) {
+      throw new Error(
+        '数据库未启用 website_po_date 列（迁移待应用）：无法校验 Website PO Date，推送已阻止。'
+      )
+    }
+    throw he
+  }
   if (hdr?.po_type === 'combined') {
     throw new Error('合并单永久冻结推送（po_type=combined），只能在内部核对/导出 Excel')
   }
@@ -450,6 +461,15 @@ export async function requestPush(id: string): Promise<void> {
   if (owners && owners.length > 0) {
     const list = owners.map((o: { po_id: string }) => o.po_id).join(', ')
     throw new Error(`该采购单已并入合并单 ${list}，不能单独推送`)
+  }
+  // 普通单进入 PAD 队列前必须有显式业务日期：缺/非法一律拒绝入队，
+  // 不能等推送器生成 8 列文件时才失败，更不允许退回旧 7 列。
+  const pushDate = formatWebsitePoDate(hdr?.website_po_date)
+  if (!pushDate) {
+    throw new Error(
+      '该采购单缺少 Website PO Date（website_po_date 为空），拒绝推送：' +
+        'PAD 导出必须由开单/核对人显式选择业务日期，系统不用创建/审批时间代替。'
+    )
   }
   const { error } = await db
     .from('tj_po_headers')

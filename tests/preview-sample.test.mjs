@@ -40,6 +40,8 @@ const HDR_STANDARD = {
   supplier_code: '4000/A01',
   supplier_name: 'AMFIX TRADING SDN BHD',
   created_at: '2026-11-10T01:00:00Z',
+  // TEST ONLY：固定测试业务日期（真实数据必须由开单人显式选择）
+  website_po_date: '2026-11-13',
 }
 const LINES = [
   { id: 'l1', line_no: 1, item_code: '0030000000003', description: 'SCREW', uom: 'UNIT', qty: 5, unit_price: 2.5, original_qty: 5, accepted_qty: 4, source_refs: [{ po_number: 'PO-000001', line_id: 'a', qty: 5 }] },
@@ -275,7 +277,7 @@ test('review 模式：旧单（无版本）保留原日期/数据，但明确标
   fs.rmSync(outDir, { recursive: true, force: true })
 })
 
-test('普通单样本保持 7 列（PAD 口径不变）', async () => {
+test('普通单 review 样本：8 列（含 Website PO Date），标注 INTERNAL NOT FOR PAD', async () => {
   const outDir = tmpDir('standard')
   const { fetchImpl } = makeRest({ headersById: { 'PO-000005': HDR_STANDARD } })
   const rest = createPreviewRest({ url: 'https://sb.test', anonKey: 'anon-key', fetchImpl })
@@ -287,9 +289,77 @@ test('普通单样本保持 7 列（PAD 口径不变）', async () => {
     log: { log: () => {}, warn: () => {} },
   })
   const poFile = out.files.find((f) => f.kind === 'po')
+  assert.ok(path.basename(poFile.path).startsWith(REVIEW_PREFIX))
   const po = await readSheet(poFile.path, 'PO_Lines')
-  assert.equal(po.rows[0].length, 7)
-  assert.equal(po.rows[0].includes('Website PO Date'), false)
+  assert.equal(po.rows[0].length, 8)
+  assert.equal(po.rows[0][7], 'Website PO Date')
+  assert.equal(po.rows[1][7], '2026-11-13')
+  const notice = await readSheet(poFile.path, 'REVIEW_NOTICE')
+  assert.match(notice.rows.flat().join(' '), /INTERNAL NOT FOR PAD/)
+  fs.rmSync(outDir, { recursive: true, force: true })
+})
+
+test('普通单 review 样本：历史缺日期仍可出内部样本（日期空、有告警），不生成 legacy 7 列', async () => {
+  const outDir = tmpDir('standard-nodate')
+  const header = { ...HDR_STANDARD, website_po_date: null }
+  const { fetchImpl } = makeRest({ headersById: { 'PO-000005': header } })
+  const rest = createPreviewRest({ url: 'https://sb.test', anonKey: 'anon-key', fetchImpl })
+  const out = await generatePreviewSample({
+    rest,
+    poIds: ['PO-000005'],
+    mode: 'review',
+    outDir,
+    log: { log: () => {}, warn: () => {} },
+  })
+  assert.ok(out.warnings.some((w) => w.includes('MISSING_WEBSITE_PO_DATE')))
+  const poFile = out.files.find((f) => f.kind === 'po')
+  const po = await readSheet(poFile.path, 'PO_Lines')
+  assert.equal(po.rows[0].length, 8)
+  for (const r of po.rows.slice(1)) {
+    assert.ok(r[7] === undefined || r[7] === null || r[7] === '', '历史缺日期不得推断')
+  }
+  fs.rmSync(outDir, { recursive: true, force: true })
+})
+
+test('普通单 formal 模式：缺日期 fail closed，不产文件', async () => {
+  const outDir = tmpDir('standard-formal-nodate')
+  const header = { ...HDR_STANDARD, website_po_date: null }
+  const { fetchImpl } = makeRest({ headersById: { 'PO-000005': header } })
+  const rest = createPreviewRest({ url: 'https://sb.test', anonKey: 'anon-key', fetchImpl })
+  await assert.rejects(
+    () =>
+      generatePreviewSample({
+        rest,
+        poIds: ['PO-000005'],
+        mode: 'formal',
+        outDir,
+        log: { log: () => {}, warn: () => {} },
+      }),
+    (e) => e.code === 'MISSING_WEBSITE_PO_DATE',
+  )
+  const leftovers = fs.existsSync(outDir) ? fs.readdirSync(outDir) : []
+  assert.deepEqual(leftovers, [])
+  fs.rmSync(outDir, { recursive: true, force: true })
+})
+
+test('普通单 formal 模式：有日期 → 正式文件名 + 8 列 PAD 口径', async () => {
+  const outDir = tmpDir('standard-formal')
+  const { fetchImpl } = makeRest({ headersById: { 'PO-000005': HDR_STANDARD } })
+  const rest = createPreviewRest({ url: 'https://sb.test', anonKey: 'anon-key', fetchImpl })
+  const out = await generatePreviewSample({
+    rest,
+    poIds: ['PO-000005'],
+    mode: 'formal',
+    outDir,
+    log: { log: () => {}, warn: () => {} },
+  })
+  const poFile = out.files.find((f) => f.kind === 'po')
+  assert.equal(path.basename(poFile.path), 'PO-000005.xlsx')
+  const po = await readSheet(poFile.path, 'PO_Lines')
+  assert.equal(po.rows[0].length, 8)
+  assert.equal(po.rows[0][7], 'Website PO Date')
+  assert.equal(po.rows[1][7], '2026-11-13')
+  assert.equal(out.warnings.length, 0)
   fs.rmSync(outDir, { recursive: true, force: true })
 })
 

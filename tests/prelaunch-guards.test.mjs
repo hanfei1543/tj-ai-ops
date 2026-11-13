@@ -132,10 +132,14 @@ test('批准快照 v2：两份迁移都只新增 nullable 版本列，不回填�
     assert.ok(snapshot.includes(field), `canonical 必须覆盖 ${field}`)
   }
 
-  // 正式导出（合并 PO / GR）都必须先过 v2 校验
+  // 正式导出（合并 PO / GR）都必须先过 v2 校验；合并单按 po_type 强制，换 mode 不能绕过
   const excel = read('web/src/lib/tjPoExcel.ts')
-  assert.match(excel, /mode === EXPORT_MODE_COMBINED[\s\S]{0,160}assertVerifiedApprovedSnapshot/)
+  assert.match(
+    excel,
+    /po\.po_type === 'combined' && mode !== EXPORT_MODE_REVIEW[\s\S]{0,160}assertVerifiedApprovedSnapshot/,
+  )
   assert.match(excel, /po\.po_type === 'combined'[\s\S]{0,200}assertVerifiedApprovedSnapshot/)
+  assert.match(excel, /EXPORT_MODE_LEGACY_STANDARD[\s\S]{0,160}LEGACY_MODE_NOT_ALLOWED/)
 
   const sample = read('scripts/lib/preview-sample.mjs')
   assert.match(sample, /mode === 'formal'[\s\S]{0,200}APPROVAL_SNAPSHOT_UNVERIFIED/)

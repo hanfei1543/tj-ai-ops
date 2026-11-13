@@ -2866,8 +2866,19 @@ declare
   v_seen_nos int[] := '{}';
   v_no int;
   v_existing_id uuid;
+  v_date date;
 begin
   v_uid := public.tj_gr_require_role(array['staff','approver']);
+
+  -- website_po_date 必填 + 格式校验（普通单保存不默认当天、不推断时间戳）。
+  -- 非法真实日期（如 2026-02-30）会在 ::date 处 raise，整笔回滚。
+  if (p_data ->> 'website_po_date') is null
+     or (p_data ->> 'website_po_date') !~ '^\d{4}-\d{2}-\d{2}$' then
+    perform public.tj_gr_fail('GR_VALIDATION',
+      'website_po_date 必填 yyyy-MM-dd（不默认当天，不推断时间戳）',
+      pg_catalog.jsonb_build_object('field','website_po_date'));
+  end if;
+  v_date := (p_data ->> 'website_po_date')::date;
 
   v_cached := public.tj_gr_request_begin('po_save', v_request, p_data);
   if v_cached is not null then
@@ -2913,17 +2924,19 @@ begin
       supplier_code = coalesce(p_data ->> 'supplier_code', supplier_code),
       supplier_name = coalesce(p_data ->> 'supplier_name', supplier_name),
       notes = case when p_data ? 'notes' then p_data ->> 'notes' else notes end,
+      website_po_date = v_date,
       updated_at = now()
     where id = v_id;
   else
-    insert into public.tj_po_headers (id, supplier_code, supplier_name, status, po_type, notes, created_by)
+    insert into public.tj_po_headers (id, supplier_code, supplier_name, status, po_type, notes, created_by, website_po_date)
     values (v_id,
             p_data ->> 'supplier_code',
             p_data ->> 'supplier_name',
             'confirmed',
             'standard',
             p_data ->> 'notes',
-            coalesce(nullif(p_data ->> 'created_by',''), v_uid::text));
+            coalesce(nullif(p_data ->> 'created_by',''), v_uid::text),
+            v_date);
   end if;
 
   if pg_catalog.jsonb_typeof(p_data -> 'lines') = 'array' then

@@ -11,6 +11,7 @@ const HDR_STANDARD = {
   status: 'pending_push',
   supplier_code: '4000/A01',
   supplier_name: 'AMFIX',
+  website_po_date: '2026-11-13', // TEST ONLY
 }
 
 function makeSbFetch({ pending, combined = [], headersById = null, lines }) {
