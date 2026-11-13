@@ -34,6 +34,11 @@ function makeSbFetch({ pending, combined = [], headersById = null, lines }) {
     if (pathname.startsWith('tj_po_lines?')) return lines
     if (pathname.startsWith('tj_po_exports')) return null
     if (pathname.startsWith('tj_po_headers?id=eq.')) return null
+    // 投递意图表：GET 无历史意图，POST/PATCH 无返回体
+    if (pathname.startsWith('tj_po_push_intents')) {
+      if ((opts.method ?? 'GET').toUpperCase() === 'GET') return []
+      return null
+    }
     throw new Error(`unexpected ${pathname}`)
   }
   return { fn, calls }

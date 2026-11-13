@@ -10,6 +10,7 @@
 //   * 显式 public schema（Accept-Profile / Content-Profile: public），避免被 PostgREST
 //     默认 schema 或环境变量悄悄切到预览库。
 //   * GR 正式 push/post 不在此实现，永远不启用。
+import { createHash } from 'node:crypto'
 import { buildPoLineRows, EXPORT_MODE_STANDARD, EXPORT_MODE_COMBINED } from '../../web/src/lib/core/po-lines.js'
 import { assertVerifiedApprovedSnapshot } from '../../web/src/lib/core/approved-snapshot.js'
 import { buildWorkbook } from '../../web/src/lib/core/xlsx.js'
@@ -19,6 +20,68 @@ export const PUBLIC_SCHEMA = 'public'
 export const BRIDGE_URL = 'http://127.0.0.1:9000'
 export const TARGET_DIR = 'C:\\Users\\Administrator\\Desktop\\operation\\PO_Queue\\Pending'
 export const POLL_SEC = 30
+
+// ---------------------------------------------------------------------------
+// PO Push 投递幂等：不确定投递窗口（第一版修正）。
+//
+// 规则（用户明确要求，不得放宽）：
+//   1) 调用 bridge 之前，先持久化 dispatch_started 投递意图。
+//   2) bridge 已被调用、但网站尚未可靠记录 delivered 就发生异常
+//      （含 bridge 抛错 / ok:false / 记录 delivered 失败）→ 一律标记
+//      delivery_uncertain，绝不允许自动再次发送。
+//   3) 同一个 PO（按 po_header_id）即使 content_sha256 不同，也不能凭新的
+//      唯一键再投递——必须检查该 PO 是否已存在任何历史投递意图。
+//   4) 不得因为 Windows Pending 文件不存在就认为可以重新投递。
+//   5) 防重复：一旦该 PO 已进入投递（dispatch_started / delivered / uncertain），
+//      不得再生成 Pending 文件（防止 Windows 已移入 Processing 后再写 Pending）。
+//
+// 投递意图表 tj_po_push_intents 是投递的唯一真相源（schema 见
+// supabase/migrations/20261114_po_push_intents.sql，尚未应用）：
+//   UNIQUE(po_header_id) —— 一个 PO 一生只允许一条投递意图（覆盖规则 3）。
+//   state ∈ dispatch_started | delivered | delivery_uncertain | needs_review
+// ---------------------------------------------------------------------------
+export const PUSH_INTENT_TABLE = 'tj_po_push_intents'
+
+export const PUSH_INTENT_STATES = Object.freeze({
+  DISPATCH_STARTED: 'dispatch_started',
+  DELIVERED: 'delivered',
+  DELIVERY_UNCERTAIN: 'delivery_uncertain',
+  NEEDS_REVIEW: 'needs_review',
+})
+
+/** 数值归一为规范十进制串：12.50 / "12.500000" / 12.5 → 都归一到 "12.5"。
+ * 保证同一存储值无论 PostgREST 以 number 或 string 返回，内容摘要一致。 */
+export function normalizeDecimal(v) {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  if (!Number.isFinite(n)) return String(v)
+  return String(n)
+}
+
+/**
+ * 投递内容指纹：只取业务字段（排除 status/updated_at/created_at/frozen/po_revision
+ * 等可变状态），按固定键序 JSON 序列化后 sha256。同 PO 同内容恒同 sha；改任何
+ * 业务字段（含 website_po_date / 行 qty / 单价 / 描述）必得不同 sha。
+ */
+export function computePushContentSha256(header, lines) {
+  const h = header ?? {}
+  const headerPart = {
+    po_type: h.po_type ?? null,
+    supplier_code: h.supplier_code ?? null,
+    supplier_name: h.supplier_name ?? null,
+    website_po_date: h.website_po_date ?? null,
+  }
+  const ls = (Array.isArray(lines) ? lines : []).map((l) => ({
+    item_code: l.item_code ?? null,
+    description: l.description ?? null,
+    uom: l.uom ?? null,
+    qty: normalizeDecimal(l.qty),
+    unit_price: normalizeDecimal(l.unit_price),
+    original_qty: l.original_qty != null ? normalizeDecimal(l.original_qty) : null,
+  }))
+  const canonical = JSON.stringify({ header: headerPart, lines: ls })
+  return createHash('sha256').update(canonical).digest('hex')
+}
 
 /** 生成 Supabase REST 访问器：只走显式 schema，调用方可注入 fetch 做测试 */
 export function createSupabaseRest({
@@ -139,6 +202,49 @@ export function createPusher({
     return rows[0]
   }
 
+  /** 查该 PO 是否已存在任何历史投递意图（规则 3/4/5：按 po_header_id，不看 sha） */
+  async function findIntentByPoHeader(poHeaderId) {
+    const rows = await sbFetch(
+      `${PUSH_INTENT_TABLE}?select=*&po_header_id=eq.${encodeURIComponent(poHeaderId)}&order=created_at.desc&limit=1`,
+    )
+    return Array.isArray(rows) && rows.length > 0 ? rows[0] : null
+  }
+
+  /** 规则 1：调用 bridge 之前先持久化 dispatch_started（UNIQUE(po_header_id) 兜底并发） */
+  async function insertIntent({ poHeaderId, poId, contentSha256, state }) {
+    await sbFetch(PUSH_INTENT_TABLE, {
+      method: 'POST',
+      body: JSON.stringify({
+        po_header_id: poHeaderId,
+        po_id: poId,
+        content_sha256: contentSha256,
+        state,
+      }),
+    })
+  }
+
+  /** 更新该 PO 投递意图状态（+ 可选错误说明），只按 po_header_id 定位 */
+  async function updateIntentState(poHeaderId, state, extra = {}) {
+    await sbFetch(`${PUSH_INTENT_TABLE}?po_header_id=eq.${encodeURIComponent(poHeaderId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ state, updated_at: now().toISOString(), ...extra }),
+    })
+  }
+
+  /** 把单据从 pending_push 拉回 confirmed，让轮询停止重扫（意图表仍是真相源，阻断重投） */
+  async function stopPollingForReview(poHeaderId, error) {
+    try {
+      await sbFetch(`tj_po_headers?id=eq.${encodeURIComponent(poHeaderId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: 'confirmed', updated_at: now().toISOString() }),
+      })
+    } catch (e) {
+      // 拉回失败不致命：意图表仍是真相源，下次仍会在这里阻断；仅记日志
+      log.error(`[warn] ${poHeaderId} 停止轮询（confirmed）失败：${e.message}`)
+    }
+    return error
+  }
+
   /** PAD 格式生成器：普通单 7 列；合并单内部验证 8 列（不解除 pushOne 的冻结）。 */
   async function buildXlsx(header, lines) {
     const combined = header?.po_type === 'combined'
@@ -169,23 +275,124 @@ export function createPusher({
     const lines = await sbFetch(
       `tj_po_lines?select=*&po_header_id=eq.${encodeURIComponent(latest.id)}&order=line_no`,
     )
+    const contentSha = computePushContentSha256(latest, Array.isArray(lines) ? lines : [])
+
+    // 规则 3/4/5：任何历史投递意图都不允许自动重投——按 po_header_id 判定，
+    // 不看 content_sha256 是否相同，也不看 Windows Pending 文件是否存在。
+    const existing = await findIntentByPoHeader(latest.id)
+    if (existing) {
+      const prevState = existing.state
+      const prevSha = existing.content_sha256
+      // 幂等重放：同 PO 同内容已 delivered → 只补状态 exported，绝不再次写 bridge。
+      if (prevState === PUSH_INTENT_STATES.DELIVERED && prevSha === contentSha) {
+        log.log(`[replay] ${latest.po_id} 已投递（同内容），补状态 exported，不重复发送`)
+        await sbFetch(`tj_po_headers?id=eq.${encodeURIComponent(latest.id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status: 'exported', updated_at: now().toISOString() }),
+        })
+        return existing.filename ?? `${latest.po_id}.xlsx`
+      }
+      // 残留 dispatch_started（上次进程在 bridge 调用期间中断）→ 升级为 delivery_uncertain。
+      if (prevState === PUSH_INTENT_STATES.DISPATCH_STARTED) {
+        await updateIntentState(latest.id, PUSH_INTENT_STATES.DELIVERY_UNCERTAIN, {
+          error: '上次投递在 bridge 调用期间中断，结果不确定',
+        })
+      }
+      const reason =
+        prevSha !== contentSha
+          ? `该 PO 已存在历史投递意图（内容 sha 不同：${prevSha} ≠ ${contentSha}），拒绝自动重投`
+          : `该 PO 已有投递意图处于 ${prevState}，拒绝自动重投`
+      throw new Error(
+        await stopPollingForReview(
+          latest.id,
+          `${reason}：请人工核对 Windows Queue 实况后再决定，绝不因 Pending 不存在而重发`,
+        ),
+      )
+    }
+
     const buf = await buildXlsx(latest, Array.isArray(lines) ? lines : [])
     const filename = `${latest.po_id}.xlsx`
-    const winPath = `${targetDir}\\${filename}`
-    const res = await bridgeCall({ write: { path: winPath, b64: buf.toString('base64') } })
-    if (!res || !res.ok) {
-      throw new Error('bridge write 失败: ' + (res?.error || JSON.stringify(res)))
+
+    // 规则 1：调用 bridge 之前，先持久化 dispatch_started 投递意图。
+    // 并发兜底：UNIQUE(po_header_id) 冲突说明另一进程已抢到 → 走已有意图判定，不重投。
+    try {
+      await insertIntent({
+        poHeaderId: latest.id,
+        poId: latest.po_id,
+        contentSha256: contentSha,
+        state: PUSH_INTENT_STATES.DISPATCH_STARTED,
+      })
+    } catch (e) {
+      const raced = await findIntentByPoHeader(latest.id)
+      if (raced) {
+        throw new Error(`该 PO 已存在投递意图（${raced.state}），并发保护拒绝自动重投，请人工核对`)
+      }
+      throw e
     }
+    const winPath = `${targetDir}\\${filename}`
+    // 规则 2：bridge 调用窗口。任何异常（含 ok:false）都视为结果不确定——
+    // 标记 delivery_uncertain 并停止轮询，绝不自动再次发送。
+    let res
+    try {
+      res = await bridgeCall({ write: { path: winPath, b64: buf.toString('base64') } })
+    } catch (e) {
+      await updateIntentState(latest.id, PUSH_INTENT_STATES.DELIVERY_UNCERTAIN, {
+        error: `bridge 调用异常：${e.message}`,
+      })
+      throw new Error(
+        await stopPollingForReview(
+          latest.id,
+          `bridge 调用结果不确定（${e.message}）：已标记 delivery_uncertain，停止自动重试，转人工核对`,
+        ),
+      )
+    }
+    if (!res || !res.ok) {
+      await updateIntentState(latest.id, PUSH_INTENT_STATES.DELIVERY_UNCERTAIN, {
+        error: `bridge 返回 ok:false（${res?.error ?? '未确认写入'}）`,
+      })
+      throw new Error(
+        await stopPollingForReview(
+          latest.id,
+          'bridge 未确认写入（ok:false）：已标记 delivery_uncertain，停止自动重试，转人工核对',
+        ),
+      )
+    }
+
+    // bridge 确认成功 → 先可靠记录 delivered，再写审计、再置 exported。
+    try {
+      await updateIntentState(latest.id, PUSH_INTENT_STATES.DELIVERED, { filename })
+    } catch (e) {
+      // bridge 已成功但 delivered 没记上 → 结果不确定，绝不重投。
+      try {
+        await updateIntentState(latest.id, PUSH_INTENT_STATES.DELIVERY_UNCERTAIN, {
+          error: `记录 delivered 失败：${e.message}`,
+        })
+      } catch (_) {
+        /* 状态都记不上：意图行仍在 dispatch_started，下次会按残留升级为 uncertain */
+      }
+      throw new Error(
+        await stopPollingForReview(
+          latest.id,
+          `bridge 已成功但投递记录失败（${e.message}）：已标记 delivery_uncertain，停止自动重试`,
+        ),
+      )
+    }
+
     const nowIso = now().toISOString()
-    await sbFetch('tj_po_exports', {
-      method: 'POST',
-      body: JSON.stringify({
-        po_header_id: latest.id,
-        po_id: latest.po_id,
-        filename,
-        exported_at: nowIso,
-      }),
-    })
+    // 审计行失败不致命：delivered 已记录，意图表是真相源；不重投，仅记日志。
+    try {
+      await sbFetch('tj_po_exports', {
+        method: 'POST',
+        body: JSON.stringify({
+          po_header_id: latest.id,
+          po_id: latest.po_id,
+          filename,
+          exported_at: nowIso,
+        }),
+      })
+    } catch (e) {
+      log.error(`[warn] ${latest.po_id} 审计行写入失败（${e.message}），delivered 已记录，不重投`)
+    }
     await sbFetch(`tj_po_headers?id=eq.${encodeURIComponent(latest.id)}`, {
       method: 'PATCH',
       body: JSON.stringify({ status: 'exported', updated_at: nowIso }),
@@ -237,5 +444,16 @@ export function createPusher({
     return summary
   }
 
-  return { runOnce, pushOne, buildXlsx, fetchPending, findSourceOwners, readHeaderById }
+  return {
+    runOnce,
+    pushOne,
+    buildXlsx,
+    fetchPending,
+    findSourceOwners,
+    readHeaderById,
+    findIntentByPoHeader,
+    insertIntent,
+    updateIntentState,
+    stopPollingForReview,
+  }
 }

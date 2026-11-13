@@ -73,6 +73,10 @@ function makeServer({ pending, combined, headersById }) {
     if (method === 'GET' && pq.startsWith('tj_po_lines?')) return json(LINES)
     if (method === 'POST' && pq.startsWith('tj_po_exports')) return json(null, 201)
     if (method === 'PATCH' && pq.startsWith('tj_po_headers?id=eq.')) return json(null, 204)
+    // 投递意图表：默认无历史意图（首次投递路径）
+    if (method === 'GET' && pq.startsWith('tj_po_push_intents?')) return json([])
+    if (method === 'POST' && pq.startsWith('tj_po_push_intents')) return json(null, 201)
+    if (method === 'PATCH' && pq.startsWith('tj_po_push_intents?')) return json(null, 204)
     throw new Error(`unexpected request ${method} ${pq}`)
   }
   return { fetchImpl, calls }

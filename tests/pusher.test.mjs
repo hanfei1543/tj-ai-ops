@@ -83,6 +83,10 @@ function makeSupabaseMock({ pending, combined, headersById = null, linesByHeader
     }
     if (method === 'POST' && pq.startsWith('tj_po_exports')) return json(null, exportPostStatus)
     if (method === 'PATCH' && pq.startsWith('tj_po_headers?id=eq.')) return json(null, 204)
+    // 投递意图表：默认无历史意图（首次投递路径）
+    if (method === 'GET' && pq.startsWith('tj_po_push_intents?')) return json([])
+    if (method === 'POST' && pq.startsWith('tj_po_push_intents')) return json(null, 201)
+    if (method === 'PATCH' && pq.startsWith('tj_po_push_intents?')) return json(null, 204)
     throw new Error(`unexpected request ${method} ${pq}`)
   }
   return { fetchImpl, calls }
@@ -148,14 +152,22 @@ test('拒绝路径 bridge 零调用，普通单正常走 bridge（同一次 runO
   assert.equal(lineFetches.length, 1)
   assert.match(lineFetches[0].pathAndQuery, /po_header_id=eq\.uuid-5/)
 
-  // 只为普通单写导出记录 + 标 exported
+  // 普通单：先持久化 dispatch_started 意图（bridge 前），再写导出审计（2 次 POST）
   const posts = sb.calls.filter((c) => c.method === 'POST')
-  assert.equal(posts.length, 1)
-  assert.equal(JSON.parse(posts[0].body).po_id, 'PO-000005')
+  const intentPost = posts.find((c) => c.pathAndQuery.startsWith('tj_po_push_intents'))
+  const exportPost = posts.find((c) => c.pathAndQuery.startsWith('tj_po_exports'))
+  assert.ok(intentPost, '必须先在 bridge 前持久化 dispatch_started 意图')
+  assert.equal(JSON.parse(intentPost.body).state, 'dispatch_started')
+  assert.ok(exportPost, '必须写导出审计记录')
+  assert.equal(JSON.parse(exportPost.body).po_id, 'PO-000005')
+  // PATCH：意图 delivered + 表头 exported
   const patches = sb.calls.filter((c) => c.method === 'PATCH')
-  assert.equal(patches.length, 1)
-  assert.equal(patches[0].pathAndQuery, 'tj_po_headers?id=eq.uuid-5')
-  assert.equal(JSON.parse(patches[0].body).status, 'exported')
+  const deliveredPatch = patches.find((c) => c.pathAndQuery.startsWith('tj_po_push_intents?'))
+  const headerPatch = patches.find((c) => c.pathAndQuery.startsWith('tj_po_headers?id=eq.'))
+  assert.ok(deliveredPatch, 'bridge 成功后必须标记 delivered')
+  assert.equal(JSON.parse(deliveredPatch.body).state, 'delivered')
+  assert.ok(headerPatch)
+  assert.equal(JSON.parse(headerPatch.body).status, 'exported')
 
   assert.ok(logs.some((l) => l.includes('[reject] PO-000003')))
   assert.ok(logs.some((l) => l.includes('[reject] PO-000001')))
@@ -207,7 +219,7 @@ test('普通单 PO_Lines 仍是原 7 列（不含 Website PO Date）', async () 
   assert.equal(ws.rowCount, 3)
 })
 
-test('bridge 失败：记为 failed，不写导出记录、不改状态', async () => {
+test('bridge 返回 ok:false：标记 delivery_uncertain、停止轮询，不写导出记录', async () => {
   const { pusher, sb, br } = buildPusher({
     pending: [HDR_STANDARD],
     combined: [],
@@ -217,9 +229,28 @@ test('bridge 失败：记为 failed，不写导出记录、不改状态', async 
   assert.equal(br.calls.length, 1)
   assert.equal(summary.pushed.length, 0)
   assert.equal(summary.failed.length, 1)
-  assert.match(summary.failed[0].error, /bridge write 失败/)
-  assert.equal(sb.calls.filter((c) => c.method === 'POST').length, 0)
-  assert.equal(sb.calls.filter((c) => c.method === 'PATCH').length, 0)
+  assert.match(summary.failed[0].error, /delivery_uncertain/)
+  // 不写导出审计、不改 exported
+  assert.equal(
+    sb.calls.filter((c) => c.method === 'POST' && c.pathAndQuery.startsWith('tj_po_exports')).length,
+    0,
+  )
+  assert.equal(
+    sb.calls.filter(
+      (c) =>
+        c.method === 'PATCH' &&
+        c.pathAndQuery.startsWith('tj_po_headers?id=eq.') &&
+        JSON.parse(c.body).status === 'exported',
+    ).length,
+    0,
+  )
+  // 但必须：先 dispatch_started 意图、再标记 delivery_uncertain、并拉回 confirmed 停止轮询
+  const intentPost = sb.calls.find((c) => c.method === 'POST' && c.pathAndQuery.startsWith('tj_po_push_intents'))
+  assert.equal(JSON.parse(intentPost.body).state, 'dispatch_started')
+  const uncertainPatch = sb.calls.find((c) => c.method === 'PATCH' && c.pathAndQuery.startsWith('tj_po_push_intents?'))
+  assert.equal(JSON.parse(uncertainPatch.body).state, 'delivery_uncertain')
+  const headerPatch = sb.calls.find((c) => c.method === 'PATCH' && c.pathAndQuery.startsWith('tj_po_headers?id=eq.'))
+  assert.equal(JSON.parse(headerPatch.body).status, 'confirmed')
 })
 
 test('pushOne 自身也拒绝合并单（深度防御）', async () => {
