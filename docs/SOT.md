@@ -1,6 +1,6 @@
 # TJ-AI-Ops 状态面板
 
-> 最后归档: 2026-11-12 09:06
+> 最后归档: 2026-11-13 02:28
 
 ## 1 当前焦点与下一步
 - **接续锚点**：已交付 Website 内部 Excel 测试文件（WEBSITE_PO_TEST.xlsx / WEBSITE_GR_TEST.xlsx，来自真实生成器 + PO-000009），核对 15/15 通过；待用户验收并决定是否继续（托管 Preview 更新／生产迁移／main merge/push 均未做）。
@@ -14,5 +14,4 @@
 - 旧 IRS POS 暂停任务：docs/handoffs/stock-setup.md，原批准边界不扩大。
 
 ## 3 未归档缓冲池
-- [PROGRESS] Website 内部 Excel 测试（PO-000009）：receipt_event_id 唯一索引已加（public PREPARED / tj_preview 已应用），真实生成器产出 WEBSITE_PO_TEST.xlsx + WEBSITE_GR_TEST.xlsx，verify_website_test.mjs 逐行核对 15/15 通过，114 项测试 + 构建通过。待用户验收。
-- [PROGRESS] PO_Lines Qty 口径修正（PAD 合约核对）：Qty 改为 original_qty（订购数量），与 GR Ordered Qty 对齐；原误用 accepted_qty 导致 PO Qty=4 vs GR Ordered=5。逐行严格核对升级到 16/16，115 项测试通过，重新生成两份 WEBSITE_* 文件。待 PAD 复审。
+- (空)
