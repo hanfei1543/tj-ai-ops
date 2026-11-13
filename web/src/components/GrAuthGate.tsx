@@ -6,13 +6,7 @@ import type { GrIdentity } from '@/lib/grAuth'
 import { capabilities } from '@/lib/core/gr-form.js'
 import type { GrCapabilities } from '@/lib/core/gr-form.js'
 import { IS_PREVIEW_SCHEMA } from '@/lib/supabaseClient'
-
-const ROLE_LABELS: Record<string, string> = {
-  staff: '员工',
-  approver: '审批',
-  executor: '放行',
-  admin: '管理',
-}
+import { roleLabel } from '@/lib/core/ui-labels.js'
 
 /** 生产环境（public）：统一收货是预览功能，入口与页面一律硬禁用（旧界面不受影响） */
 function PreviewDisabled() {
@@ -138,17 +132,21 @@ export default function GrAuthGate({ children }: { children: (identity: GrIdenti
             </Link>
           </div>
           <div className="flex items-center gap-2 text-xs text-slate-600">
-            <span className="font-medium text-slate-800">{identity.displayName || identity.email}</span>
+            <span className="font-medium text-slate-800" title={identity.displayName || identity.email}>
+              当前身份
+            </span>
             <span className="text-slate-400">·</span>
             {identity.roles.length === 0 ? (
               <span className="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-700">无角色</span>
             ) : (
               identity.roles.map((r) => (
                 <span key={r} className="rounded-full bg-emerald-100 px-2 py-0.5 font-medium text-emerald-700">
-                  {ROLE_LABELS[r] ?? r}
+                  {roleLabel(r)}
                 </span>
               ))
             )}
+            <span className="text-slate-400">·</span>
+            <span className="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-700">测试环境</span>
             <button
               type="button"
               onClick={() => void signOutGr().then(() => refresh())}
@@ -160,8 +158,8 @@ export default function GrAuthGate({ children }: { children: (identity: GrIdenti
         </div>
       </div>
       <div className="mx-auto max-w-5xl px-4 py-6 md:px-8">
-        <p className="mb-4 text-[11px] text-slate-400">
-          权限由服务器强制（此处只决定按钮显示）；任务发布不等于 IRS 成功。
+        <p className="mb-4 rounded-xl bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
+          测试环境：数据不会自动进入 IRS。权限由服务器强制，本页按钮只决定显示。
         </p>
         {children(identity, caps)}
       </div>

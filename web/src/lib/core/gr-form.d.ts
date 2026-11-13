@@ -83,6 +83,7 @@ export function parseDecimalString(
 ): DecimalResult
 export function addDecimalStrings(values: unknown[]): string
 export function compareDecimalStrings(a: unknown, b: unknown): 1 | 0 | -1
+export function multiplyDecimalStrings(a: unknown, b: unknown): string
 export function normalizeRoles(raw: unknown): string[]
 export function capabilities(identity: { roles?: unknown } | null | undefined): GrCapabilities
 export function isReceivablePoStatus(status: unknown): boolean

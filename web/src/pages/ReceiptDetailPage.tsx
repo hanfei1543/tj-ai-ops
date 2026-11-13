@@ -12,6 +12,11 @@ import {
 import type { GrCapabilities } from '@/lib/core/gr-form.js'
 import type { GrIdentity } from '@/lib/grAuth'
 import type { GrReceiptEvent, GrTask } from '@/types/tjGr'
+import { exceptionLabel, warningLabel } from '@/lib/core/ui-labels.js'
+
+function shortId(id: string): string {
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id
+}
 
 function fmt(iso?: string | null): string {
   if (!iso) return '—'
@@ -21,12 +26,13 @@ function fmt(iso?: string | null): string {
 }
 
 function warningText(w: unknown): string {
-  if (typeof w === 'string') return w
+  if (typeof w === 'string') return warningLabel(w)
   if (w && typeof w === 'object') {
     const o = w as Record<string, unknown>
     const code = String(o.code ?? 'warning')
     const detail = o.detail ?? o.message
-    return detail ? `${code}：${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : code
+    const label = warningLabel(code) ?? exceptionLabel(code)
+    return detail && detail !== code ? `${label}：${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : label
   }
   return String(w ?? '')
 }
@@ -227,13 +233,14 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
           <Link to="/tj-po-system/receipts" className="text-xs text-slate-500 hover:underline">
             ← 返回收货列表
           </Link>
-          <h1 className="mt-1 text-2xl font-bold text-slate-900">收货事件详情</h1>
+          <h1 className="mt-1 text-2xl font-bold text-slate-900">收货详情</h1>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-            <span className="font-mono text-[11px]" title={event.id}>{event.id}</span>
+            <span className="font-mono text-sm font-semibold text-slate-900" title={event.id}>
+              {event.event_no || shortId(event.id)}
+            </span>
             <span className={`rounded-full px-2 py-0.5 font-medium ${badge.cls}`}>{badge.label}</span>
-            <span className="rounded bg-slate-100 px-2 py-0.5">v{event.revision ?? 0}</span>
             {event.review_required && (
-              <span className="rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-700">需复核</span>
+              <span className="rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-700">需要人工检查</span>
             )}
           </div>
         </div>
@@ -267,16 +274,16 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
 
       {event.review_required && !redoLock && (
         <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          <div className="font-semibold">需复核（review_required）</div>
+          <div className="font-semibold">需要人工检查</div>
           <p className="mt-1 text-xs">
-            服务端在本次事件里发现异常（超收/额外行/疑似重复单）：不能当作已批准，请审批人逐条核对后处理。
+            这次收货里发现了需要人工核对的情况（超收 / 额外货品 / 单据号码可能重复）：不能当作已批准，请审批人逐条核对后处理。
           </p>
         </div>
       )}
 
       {warnings.length > 0 && (
         <div className="mb-4 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700">
-          <div className="font-semibold">服务端警告（{warnings.length}）</div>
+          <div className="font-semibold">需要注意的问题</div>
           <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs">
             {warnings.map((w, i) => (
               <li key={i}>{warningText(w)}</li>
@@ -287,11 +294,11 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
 
       {Array.isArray(event.exceptions) && event.exceptions.length > 0 && (
         <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          <div className="font-semibold">服务端异常（{event.exceptions.length}）</div>
+          <div className="font-semibold">需要确认的例外（{event.exceptions.length}）</div>
           <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs">
             {event.exceptions.map((x, i) => (
               <li key={`${x.code ?? 'x'}-${i}`}>
-                {x.code ?? 'exception'}
+                {exceptionLabel(x.code)}
                 {x.detail ? `：${typeof x.detail === 'string' ? x.detail : JSON.stringify(x.detail)}` : ''}
               </li>
             ))}
@@ -301,8 +308,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
 
       {extraLines.length > 0 && (
         <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900">
-          有 {extraLines.length} 行没有可核实的原 PO 来源分配：审批可保留，但放行会被服务端以
-          GR_EXTRA_ASSIGNMENT_REQUIRED 阻止（需人工指定来源/确认无法自动过账），不会当作成功过账。
+          有 {extraLines.length} 行没有可核实的原采购单明细（额外货品）：审批可保留，但放行会被服务端阻止，需人工指定来源，界面不会把漏行当作成功。
         </div>
       )}
 
@@ -328,19 +334,19 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
       </section>
 
       <section className="mb-4">
-        <h2 className="mb-2 text-sm font-semibold text-slate-700">收货明细（{event.lines?.length ?? 0} 行）</h2>
+        <h2 className="mb-2 text-sm font-semibold text-slate-700">商品核对（{event.lines?.length ?? 0} 行）</h2>
         <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
           <table className="min-w-full text-xs">
             <thead className="bg-slate-50 text-slate-500">
               <tr>
                 <th className="px-3 py-2 text-left">#</th>
-                <th className="px-3 py-2 text-left">Item</th>
+                <th className="px-3 py-2 text-left">商品编号</th>
                 <th className="px-3 py-2 text-left">描述</th>
-                <th className="px-3 py-2 text-left">UOM</th>
-                <th className="px-3 py-2 text-right">订购</th>
-                <th className="px-3 py-2 text-right">实收</th>
+                <th className="px-3 py-2 text-left">单位</th>
+                <th className="px-3 py-2 text-right">订购（整单）</th>
+                <th className="px-3 py-2 text-right">本批实收</th>
                 <th className="px-3 py-2 text-right">单价</th>
-                <th className="px-3 py-2 text-left">来源分配（原始 PO / 行 / 数量）</th>
+                <th className="px-3 py-2 text-left">来源</th>
                 <th className="px-3 py-2 text-left">备注</th>
               </tr>
             </thead>
@@ -356,12 +362,8 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
                   <td className="px-3 py-2 text-right text-slate-600">{l.unit_price}</td>
                   <td className="px-3 py-2 text-slate-500">
                     {((l.sources ?? l.source_allocations ?? []).length === 0)
-                      ? '（无来源，额外行）'
-                      : (l.sources ?? l.source_allocations ?? []).map((a) => (
-                          <div key={`${a.po_header_id}:${a.po_line_id}`} className="font-mono text-[10px]">
-                            {a.po_header_id.slice(0, 8)}… / {a.po_line_id.slice(0, 8)}… × {a.accepted_qty}
-                          </div>
-                        ))}
+                      ? '额外货品（无来源）'
+                      : `${(l.sources ?? l.source_allocations ?? []).length} 个来源`}
                   </td>
                   <td className="px-3 py-2 text-slate-500">{l.note || ''}</td>
                 </tr>
@@ -374,16 +376,19 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
             </tbody>
           </table>
         </div>
+        <p className="mt-1 text-[11px] text-slate-400">
+          订购数量是整张采购单的订购量（分批收货时每一批都显示完整订购量作为参照），本批实收是这次实际收到的数量；累计剩余由系统在批准时按来源行核对。
+        </p>
       </section>
 
       <section className="mb-4">
         <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-700">
-          本机任务
-          <span className="text-[11px] font-normal text-slate-400">任务发布不等于 IRS 成功，执行结果以本机回报为准</span>
+          系统处理进度
+          <span className="text-[11px] font-normal text-slate-400">不等于 IRS 已过账，结果以系统回报为准</span>
         </h2>
         {tasks.length === 0 ? (
           <div className="rounded-xl border border-dashed border-slate-300 bg-white py-6 text-center text-xs text-slate-400">
-            暂无任务（未放行或服务端未生成）
+            暂无进度（未放行或系统未生成任务）
           </div>
         ) : (
           <ul className="space-y-1.5">
@@ -391,11 +396,9 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
               const tb = taskStatusBadge(t.status)
               return (
                 <li key={t.id} className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs">
-                  <span className="font-mono text-[10px] text-slate-500">{t.id.slice(0, 8)}…</span>
                   <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">{tb.label}</span>
-                  <span className="text-slate-400">原始状态：{t.status || '空'}</span>
-                  {t.irs_po_no && <span className="text-slate-600">IRS PO No.：{t.irs_po_no}</span>}
-                  {t.irs_grn_no && <span className="text-slate-600">IRS GRN No.：{t.irs_grn_no}</span>}
+                  {t.irs_po_no && <span className="text-slate-600">IRS 采购单编号：{t.irs_po_no}</span>}
+                  {t.irs_grn_no && <span className="text-slate-600">IRS 收货单编号：{t.irs_grn_no}</span>}
                   {t.last_error ? <span className="text-red-600">{t.last_error}</span> : null}
                 </li>
               )
@@ -404,7 +407,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
         )}
         {reportedTasks.length > 0 && (
           <p className="mt-2 text-[11px] text-slate-400">
-            IRS 编号来自任务回报（tasks[].irs_po_no / irs_grn_no），不是表头历史字段；仍需人工核对是否真正过账。
+            IRS 编号来自系统回报，不是表头历史字段；仍需人工核对是否真正过账。
           </p>
         )}
       </section>
@@ -412,40 +415,45 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
       {canApproveNow && (
         <section className="mb-4 rounded-2xl border border-emerald-200 bg-white p-4">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-            <ShieldCheck className="h-4 w-4 text-emerald-600" /> 审批（审批角色）
+            <ShieldCheck className="h-4 w-4 text-emerald-600" /> 批准收货
           </h2>
-          <label className="mt-2 flex items-center gap-2 text-sm text-slate-700">
-            <input
-              type="checkbox"
-              checked={allowExceptions}
-              onChange={(e) => setAllowExceptions(e.target.checked)}
-              className="h-4 w-4 accent-emerald-600"
-            />
-            确认例外（超收/额外行）
-          </label>
-          <label className="mt-2 block text-xs font-medium text-slate-600">
-            复核说明
-            <input
-              value={reviewNote}
-              onChange={(e) => setReviewNote(e.target.value)}
-              className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-emerald-500"
-            />
-          </label>
+          {/* 只有真实存在超收/额外货品时，才出现例外确认；正常收货不要求勾选 */}
+          {Array.isArray(event.exceptions) && event.exceptions.length > 0 && (
+            <>
+              <label className="mt-2 flex items-center gap-2 text-sm text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={allowExceptions}
+                  onChange={(e) => setAllowExceptions(e.target.checked)}
+                  className="h-4 w-4 accent-emerald-600"
+                />
+                我已确认超收 / 额外货品的情况
+              </label>
+              <label className="mt-2 block text-xs font-medium text-slate-600">
+                复核说明（必填）
+                <input
+                  value={reviewNote}
+                  onChange={(e) => setReviewNote(e.target.value)}
+                  className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-emerald-500"
+                />
+              </label>
+            </>
+          )}
           <button
             type="button"
             onClick={() => void handleApprove()}
             disabled={busy !== ''}
             className="mt-3 inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
           >
-            {busy === 'approve' ? <Loader2 className="h-4 w-4 animate-spin" /> : null} 批准
+            {busy === 'approve' ? <Loader2 className="h-4 w-4 animate-spin" /> : null} 批准收货
           </button>
         </section>
       )}
 
       {canReleaseNow && (
         <section className="mb-4 rounded-2xl border border-slate-200 bg-white p-4">
-          <h2 className="text-sm font-semibold text-slate-700">放行（审批角色）</h2>
-          <p className="mt-1 text-xs text-slate-500">放行只生成本机任务；IRS 过账仍需本机回报，界面不会标成 IRS 成功。</p>
+          <h2 className="text-sm font-semibold text-slate-700">放行（交给系统处理）</h2>
+          <p className="mt-1 text-xs text-slate-500">放行只生成本机任务；IRS 是否过账以系统回报为准，界面不会标成 IRS 成功。</p>
           <button
             type="button"
             onClick={() => void handleRelease()}
@@ -534,6 +542,29 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
           继续编辑草稿
         </Link>
       )}
+
+      {/* 技术详情：内部编号 / 版本 / 来源明细 / 哈希，普通员工默认不展开；管理员/排障可查看复制 */}
+      <details className="mt-4 rounded-xl border border-slate-200 bg-white px-4 py-3">
+        <summary className="cursor-pointer select-none text-xs font-medium text-slate-500 hover:text-slate-700">
+          技术详情 / 审计记录
+        </summary>
+        <div className="mt-2 space-y-1 font-mono text-[11px] text-slate-500">
+          <div>收货记录内部编号：{event.id}</div>
+          <div>版本 revision：{event.revision ?? 0}</div>
+          {event.payload_sha256 && <div>内容哈希：{event.payload_sha256}</div>}
+          <div>来源采购单：{(event.po_ids ?? []).join(', ') || '—'}</div>
+          <div>操作人 ID：{identity.userId || identity.email || '—'}</div>
+          {(event.lines ?? []).map((l) => (
+            <div key={l.id}>
+              行 {l.line_no} 来源：
+              {((l.sources ?? l.source_allocations ?? []).length === 0)
+                ? '无（额外货品）'
+                : (l.sources ?? l.source_allocations ?? []).map((a) => ` ${a.po_header_id}/${a.po_line_id}×${a.accepted_qty}`).join('；')}
+            </div>
+          ))}
+          <div>完整任务/审计信息见服务端 tj_gr_tasks / tj_gr_audit（本页不删减底层数据）。</div>
+        </div>
+      </details>
 
       <p className="mt-4 text-[11px] text-slate-400">
         操作人：{identity.displayName || identity.email}。真实权限由服务器强制，本页按钮只是显示控制。

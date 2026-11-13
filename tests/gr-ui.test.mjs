@@ -304,16 +304,29 @@ test('防双击：save/submit 在飞行中一律拒绝第二次，结束后才�
 
 test('收货状态：waiting_mapping / needs_review 有中文且保留原始码；blocked 不是真实状态', () => {
   const waiting = receiptStatusBadge('waiting_mapping')
-  assert.match(waiting.label, /等待映射/)
+  assert.match(waiting.label, /等待登记 IRS 采购单编号/)
   assert.equal(waiting.raw, 'waiting_mapping')
   // 服务端没有 blocked 事件状态：不虚构专门文案，未知状态如实显示原始码
   const blocked = receiptStatusBadge('blocked')
   assert.equal(blocked.known, false)
   assert.match(blocked.label, /blocked/)
   const review = receiptStatusBadge('needs_review')
-  assert.match(review.label, /需复核/)
+  assert.match(review.label, /需要人工检查/)
   // 未知状态不冒充成功
   assert.match(receiptStatusBadge('weird').label, /weird/)
+})
+
+test('收货状态：四个 IRS 阶段（已审批/已放行/已尝试保存/已核对）文案各不相同，不合并成成功', () => {
+  const approved = receiptStatusBadge('approved').label
+  const released = receiptStatusBadge('released').label
+  const saved = receiptStatusBadge('saved_unverified').label
+  const verified = receiptStatusBadge('verified').label
+  assert.notEqual(approved, released)
+  assert.notEqual(released, saved)
+  assert.notEqual(saved, verified)
+  assert.doesNotMatch(released, /IRS 成功|已过账/)
+  assert.match(saved, /等待核对/)
+  assert.match(verified, /IRS 已核对完成/)
 })
 
 test('任务状态：绝不标成 IRS 成功/已过账', () => {
@@ -322,8 +335,8 @@ test('任务状态：绝不标成 IRS 成功/已过账', () => {
     assert.equal(b.irs_confirmed, false)
     assert.doesNotMatch(b.label, /IRS\s*(成功|已过账)/)
   }
-  assert.match(taskStatusBadge('planned').label, /未推送 IRS/)
-  assert.match(taskStatusBadge('done').label, /不是 IRS 过账/)
+  assert.match(taskStatusBadge('planned').label, /等待系统处理/)
+  assert.match(taskStatusBadge('done').label, /不等于 IRS 过账/)
 })
 
 test('角色能力：只有 approver/admin 能批准，只有 executor/admin 能放行，无身份全关', () => {

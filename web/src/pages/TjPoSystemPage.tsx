@@ -29,9 +29,10 @@ import {
   updatePo,
 } from '@/lib/tjPoApi'
 import type { Item, PoHeader, PoLineInput, Supplier } from '@/types/tjPo'
-import { isCombinableSource, isReceivablePoStatus } from '@/lib/core/gr-form.js'
+import { isCombinableSource, isReceivablePoStatus, addDecimalStrings, multiplyDecimalStrings } from '@/lib/core/gr-form.js'
 import { toPoLineInputs } from '@/lib/core/po-input.js'
 import { formatWebsitePoDate } from '@/lib/core/po-lines.js'
+import { poStatusInfo } from '@/lib/core/ui-labels.js'
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -43,39 +44,28 @@ function nextKey(): string {
   return `k${Date.now()}_${uid}`
 }
 
-function fmtDate(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ''
-  const dd = String(d.getDate()).padStart(2, '0')
-  const mm = String(d.getMonth() + 1).padStart(2, '0')
-  const yyyy = d.getFullYear()
-  const hh = String(d.getHours()).padStart(2, '0')
-  const mi = String(d.getMinutes()).padStart(2, '0')
-  return `${dd}/${mm}/${yyyy} ${hh}:${mi}`
+/** PO 状态徽章：区分普通单 / 合并单 / 合并占用 / 已合并（文案来自 ui-labels 单一真相源） */
+function poStatusBadge(status: string, poType: string): { label: string; cls: string } {
+  const info = poStatusInfo(status, poType)
+  return { label: info.label, cls: info.cls }
 }
 
-/** PO 状态徽章：区分普通单 / 合并单 / 合并占用 / 已合并 */
-function poStatusBadge(status: string, poType: string): { label: string; cls: string } {
-  if (poType === 'combined') {
-    if (status === 'pending_approval') return { label: '合并单·待审批', cls: 'bg-amber-100 text-amber-700' }
-    if (status === 'exported') return { label: '合并单·已导出', cls: 'bg-emerald-100 text-emerald-700' }
-    if (status === 'pending_push') return { label: '合并单·推送中', cls: 'bg-blue-100 text-blue-700' }
-    return { label: '合并单', cls: 'bg-violet-100 text-violet-700' }
-  }
-  switch (status) {
-    case 'exported':
-      return { label: '已导出', cls: 'bg-emerald-100 text-emerald-700' }
-    case 'pending_push':
-      return { label: '推送中…', cls: 'bg-blue-100 text-blue-700' }
-    case 'combining':
-      return { label: '合并中', cls: 'bg-blue-100 text-blue-700' }
-    case 'combined':
-      return { label: '已合并', cls: 'bg-slate-200 text-slate-600' }
-    case 'pending_approval':
-      return { label: '待审批', cls: 'bg-amber-100 text-amber-700' }
-    default:
-      return { label: '未导出', cls: 'bg-amber-100 text-amber-700' }
-  }
+/** 列表筛选分组（只按后端真实状态，不虚构「需要检查」这类 PO 没有的状态） */
+const PO_FILTERS: Array<{ key: string; label: string }> = [
+  { key: 'all', label: '全部' },
+  { key: 'confirmed', label: '待处理' },
+  { key: 'pending_push', label: '发送中' },
+  { key: 'exported', label: '已发送' },
+  { key: 'combined', label: '已合并' },
+  { key: 'pending_approval', label: '待审批' },
+  { key: 'cancelled', label: '已取消' },
+]
+
+/** 计算某张 PO 属于哪个筛选分组 */
+function poFilterKey(p: PoHeader): string {
+  if (p.po_type === 'combined') return 'combined'
+  if (p.status === 'combining' || p.status === 'combined') return 'combined'
+  return p.status
 }
 
 interface EditableLine {
@@ -89,6 +79,16 @@ interface EditableLine {
 
 function emptyLine(): EditableLine {
   return { key: nextKey(), item: null, itemQuery: '', qty: '', unitPrice: '' }
+}
+
+/** 单行小计（数量 × 单价，decimal string 定点乘法；非法/未填返回空串） */
+function lineSubtotal(l: EditableLine): string {
+  if (!l.item || !l.qty.trim() || !l.unitPrice.trim()) return ''
+  try {
+    return multiplyDecimalStrings(l.qty, l.unitPrice)
+  } catch {
+    return ''
+  }
 }
 
 /** 订货方（朋友五金店）署名 */
@@ -317,6 +317,8 @@ function PoList({
   const [exportingId, setExportingId] = useState('')
   const [combineMode, setCombineMode] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  // 状态筛选：只按后端真实状态分组，不虚构假状态
+  const [filter, setFilter] = useState<string>('all')
 
   // Add New Item 暂停：界面不显示入口，旧快捷键入口也已移除（直链进入只看到停用说明，
   // 写 API 同样被拒绝），避免任何隐藏路径绕过暂停。
@@ -389,23 +391,24 @@ function PoList({
     onCombine(Array.from(selected))
   }
 
+  const filteredPos = pos.filter((p) => filter === 'all' || poFilterKey(p) === filter)
+
   return (
     <div className="min-h-screen bg-slate-50 px-4 py-6 md:px-8">
       <div className="mx-auto max-w-3xl">
         <header className="mb-6 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="text-2xl font-bold leading-tight text-slate-900">采购单</h1>
-            <p className="text-sm font-medium text-slate-500">Purchase Order</p>
             <p className="mt-1 text-sm text-slate-500">建立采购单、导出 Excel 交给 PAD 录入 IRS</p>
             {IS_PREVIEW_SCHEMA && (
               <p className="mt-1 text-xs text-amber-600">
-                预览环境：保存 PO / 登记收货需要登录身份 →
+                测试环境：数据不会自动进入 IRS。
                 <button
                   type="button"
                   onClick={() => navigate('/tj-po-system/receipts')}
                   className="ml-1 font-semibold underline"
                 >
-                  收货中心登录
+                  去登记收货
                 </button>
               </p>
             )}
@@ -454,6 +457,26 @@ function PoList({
           <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
         )}
 
+        {/* 状态筛选：只按后端真实状态分组 */}
+        {!combineMode && (
+          <div className="mb-4 flex flex-wrap gap-1.5">
+            {PO_FILTERS.map((f) => (
+              <button
+                key={f.key}
+                type="button"
+                onClick={() => setFilter(f.key)}
+                className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
+                  filter === f.key
+                    ? 'bg-emerald-600 text-white'
+                    : 'bg-white text-slate-600 border border-slate-200 hover:border-emerald-300'
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+        )}
+
         {loading ? (
           <div className="flex items-center justify-center py-20 text-slate-400">
             <Loader2 className="mr-2 h-5 w-5 animate-spin" /> 加载中…
@@ -469,10 +492,15 @@ function PoList({
               <Plus className="h-4 w-4" /> 建立第一张采购单
             </button>
           </div>
+        ) : filteredPos.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-slate-300 bg-white py-16 text-center text-slate-500">
+            这个状态下没有采购单
+          </div>
         ) : (
           <ul className="space-y-2">
-            {pos.map((p) => {
+            {filteredPos.map((p) => {
               const s = poStatusBadge(p.status, p.po_type)
+              const hint = poStatusInfo(p.status, p.po_type).hint
               const combinable = isCombinableSource(p)
               const notCombinable = combineMode && !combinable
               const receivable = isReceivablePoStatus(p.status)
@@ -506,19 +534,26 @@ function PoList({
                   >
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-mono text-sm font-semibold text-slate-900">{p.po_id}</span>
-                      {p.created_by && (
-                        <span className="rounded-md bg-violet-100 px-2 py-0.5 text-xs font-bold text-violet-700">[{p.created_by}]</span>
-                      )}
                       <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${s.cls}`}>{s.label}</span>
                     </div>
                     <div className="mt-1 truncate text-sm text-slate-700">{p.supplier_name}</div>
-                    <div className="mt-0.5 text-xs text-slate-400">
-                      {p.supplier_code} · {p.line_count ?? 0} 项 · {fmtDate(p.created_at)}
-                      {p.source_po_ids && p.source_po_ids.length > 0 && (
-                        <span className="ml-1 text-slate-300">← 来源 {p.source_po_ids.join(', ')}</span>
-                      )}
+                    <div className="mt-0.5 text-xs text-slate-500">
+                      采购日期 {p.website_po_date ?? '—'} · {p.line_count ?? 0} 项
                     </div>
+                    {hint && <div className="mt-1 text-xs text-slate-400">{hint}</div>}
                   </button>
+                  {/* 技术详情：内部编号/开单人/来源单，普通员工默认不展开 */}
+                  <details className="shrink-0 text-xs text-slate-400">
+                    <summary className="cursor-pointer select-none hover:text-slate-600">技术详情</summary>
+                    <div className="mt-1 space-y-0.5 font-mono text-[11px] text-slate-400">
+                      <div>供应商编号：{p.supplier_code}</div>
+                      <div>开单人：{p.created_by || '—'}</div>
+                      {p.source_po_ids && p.source_po_ids.length > 0 && (
+                        <div>来源单：{p.source_po_ids.join(', ')}</div>
+                      )}
+                      <div>内部编号：{p.id}</div>
+                    </div>
+                  </details>
                   {!combineMode && p.po_type === 'combined' && p.status === 'confirmed' && (
                     <span
                       className="shrink-0 rounded-lg border border-slate-200 bg-slate-100 px-2.5 py-1.5 text-xs font-semibold text-slate-500"
@@ -903,10 +938,10 @@ function PoEditor({
           />
         </section>
 
-        {/* Website PO Date（显式业务日期，导出 PAD 必填） */}
+        {/* 采购日期（显式业务日期，导出 PAD 必填） */}
         <section className="mb-5">
           <label htmlFor="website-po-date" className="mb-1.5 block text-sm font-medium text-slate-600">
-            Website PO Date（业务日期）
+            采购日期 <span className="text-red-500">*</span>
           </label>
           <input
             id="website-po-date"
@@ -917,7 +952,7 @@ function PoEditor({
             className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 disabled:bg-slate-100 disabled:text-slate-400 md:w-64"
           />
           <p className="mt-1 text-xs text-slate-400">
-            PAD 导出必填：按采购业务日期手动选择；不默认当天，也不用创建/审批时间代替。
+            必填：按采购业务日期手动选择；不默认当天，也不用创建/审批时间代替。
             已冻结或已推送/导出的单据不可修改。
           </p>
         </section>
@@ -980,6 +1015,23 @@ function PoEditor({
           >
             <Plus className="h-4 w-4" /> 加一行商品
           </button>
+
+          {/* 总金额（数量×单价 小计之和；有非法输入时不显示，避免误导） */}
+          {(() => {
+            const subtotals = lines.map(lineSubtotal).filter((s) => s !== '')
+            if (subtotals.length === 0) return null
+            try {
+              const total = addDecimalStrings(subtotals)
+              return (
+                <div className="mt-3 flex items-center justify-between rounded-xl bg-slate-50 px-4 py-3">
+                  <span className="text-sm font-medium text-slate-600">总金额</span>
+                  <span className="text-lg font-bold text-slate-900">RM {total}</span>
+                </div>
+              )
+            } catch {
+              return null
+            }
+          })()}
         </section>
 
         {/* 备注 */}
@@ -1308,6 +1360,9 @@ function LineRow({
             inputMode="decimal"
             className="w-full rounded-lg border border-slate-300 px-3 py-2 text-right text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
           />
+          <div className="mt-0.5 text-right text-[11px] text-slate-400">
+            小计 {lineSubtotal(line) ? `RM ${lineSubtotal(line)}` : '—'}
+          </div>
         </div>
 
         {/* 单位 */}

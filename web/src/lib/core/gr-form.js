@@ -15,6 +15,8 @@
 //     review_required 明确展示，不虚构 blocked 等不存在的状态；
 //     任务永远不等于 IRS 成功/已过账。
 
+import { eventStatusInfo, taskStatusInfo } from './ui-labels.js'
+
 export const DRAFT_STORAGE_PREFIX = 'tj_gr_draft:'
 
 export const RECEIPT_ROLES = Object.freeze(['staff', 'approver', 'executor', 'admin'])
@@ -136,6 +138,32 @@ export function compareDecimalStrings(a, b) {
   return va > vb ? 1 : va < vb ? -1 : 0
 }
 
+/** decimal string 定点乘法（BigInt，不丢精度；仅用于 UI 小计/总额展示，不参与保存） */
+export function multiplyDecimalStrings(a, b) {
+  const ra = parseDecimalString(a)
+  const rb = parseDecimalString(b)
+  if (!ra.ok) throw new Error(ra.error)
+  if (!rb.ok) throw new Error(rb.error)
+  const scaled = (v) => {
+    const { int, frac } = decimalParts(v)
+    const sc = frac.length
+    return { n: BigInt(int) * 10n ** BigInt(sc) + BigInt(frac || '0'), sc }
+  }
+  const A = scaled(ra.value)
+  const B = scaled(rb.value)
+  const product = A.n * B.n
+  const scale = A.sc + B.sc
+  const neg = product < 0n
+  const abs = neg ? -product : product
+  const s = abs.toString()
+  let out
+  if (scale === 0) out = s
+  else if (s.length <= scale) out = '0.' + '0'.repeat(scale - s.length) + s
+  else out = s.slice(0, s.length - scale) + '.' + s.slice(s.length - scale)
+  out = out.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')
+  return (neg ? '-' : '') + (out || '0')
+}
+
 /** 角色白名单归一：未知角色丢弃，重复去重 */
 export function normalizeRoles(raw) {
   if (!Array.isArray(raw)) return []
@@ -171,60 +199,14 @@ export function capabilities(identity) {
 
 /** 收货事件状态徽章：未知状态如实显示，不冒充成功 */
 export function receiptStatusBadge(status) {
-  const raw = String(status ?? '').trim()
-  const map = {
-    draft: ['草稿', 'bg-slate-100 text-slate-600'],
-    saved: ['草稿已保存', 'bg-slate-100 text-slate-600'],
-    submitted: ['已提交（待审批）', 'bg-amber-100 text-amber-700'],
-    pending_approval: ['待审批', 'bg-amber-100 text-amber-700'],
-    approved: ['已批准（待放行）', 'bg-emerald-100 text-emerald-700'],
-    waiting_mapping: ['等待映射（waiting_mapping）', 'bg-amber-100 text-amber-700'],
-    released: ['已放行（未推送 IRS）', 'bg-emerald-100 text-emerald-700'],
-    in_progress: ['本机处理中（未验证）', 'bg-blue-100 text-blue-700'],
-    saved_unverified: ['本机已保存（未核对）', 'bg-blue-100 text-blue-700'],
-    verified: ['证据核对通过（未推送 IRS）', 'bg-emerald-100 text-emerald-700'],
-    needs_review: ['需复核（needs_review）', 'bg-red-100 text-red-700'],
-    failed_unsaved: ['保存失败（未写入）', 'bg-red-100 text-red-700'],
-    rejected: ['已拒绝', 'bg-slate-200 text-slate-600'],
-    cancelled: ['已取消', 'bg-slate-200 text-slate-600'],
-  }
-  const hit = map[raw]
-  if (hit) return { label: hit[0], cls: hit[1], raw, known: true }
-  return {
-    label: raw ? `未知状态（${raw}），请核对服务端` : '未知状态（空）',
-    cls: 'bg-slate-200 text-slate-600',
-    raw,
-    known: false,
-  }
+  const info = eventStatusInfo(status)
+  return { label: info.label, cls: info.cls, raw: info.raw, known: info.known, hint: info.hint }
 }
 
 /** 任务状态徽章：任务发布永远不等于 IRS 成功 */
 export function taskStatusBadge(status) {
-  const raw = String(status ?? '').trim()
-  const map = {
-    ready: '任务已准备（未推送 IRS）',
-    planned: '任务已准备（未推送 IRS）',
-    queued: '任务已准备（未推送 IRS）',
-    pending: '任务已准备（未推送 IRS）',
-    claimed: '已领取，等待本机保存（未推送 IRS）',
-    save_attempted: '本机已开始保存（结果未经确认）',
-    sent: '已交本机处理（执行结果未经确认）',
-    dispatched: '已交本机处理（执行结果未经确认）',
-    saved_unverified: '本机回报已保存（未逐行核对）',
-    verified: '本机证据核对通过（未推送 IRS）',
-    done: '本机回报完成（不是 IRS 过账）',
-    completed: '本机回报完成（不是 IRS 过账）',
-    failed_unsaved: '保存失败（从未开始写入，需人工处理）',
-    failed: '执行失败（需人工核对）',
-    needs_review: '需复核（人工处理，不自动重试）',
-    cancelled: '已取消',
-  }
-  return {
-    label: map[raw] ?? `未知任务状态（${raw || '空'}），按未推送处理`,
-    raw,
-    // 前端永远不认定 IRS 已成功/已过账
-    irs_confirmed: false,
-  }
+  const info = taskStatusInfo(status)
+  return { label: info.label, raw: info.raw, irs_confirmed: info.irs_confirmed, hint: info.hint }
 }
 
 /**

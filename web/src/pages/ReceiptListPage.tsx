@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, Loader2, RefreshCw } from 'lucide-react'
 import { listReceipts } from '@/lib/tjGrApi'
 import { receiptStatusBadge } from '@/lib/core/gr-form.js'
+import { warningLabel } from '@/lib/core/ui-labels.js'
 import type { GrIdentity } from '@/lib/grAuth'
 import type { GrCapabilities } from '@/lib/core/gr-form.js'
 import type { GrReceiptEvent } from '@/types/tjGr'
@@ -11,15 +12,23 @@ function shortId(id: string): string {
   return id.length > 8 ? `${id.slice(0, 8)}…` : id
 }
 
-function fmt(iso?: string | null): string {
-  if (!iso) return ''
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return String(iso)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+/** 下一步操作提示（只按后端真实状态，不虚构） */
+function nextActionHint(ev: GrReceiptEvent): string {
+  const s = String(ev.status ?? '').trim()
+  if (s === 'draft') return '草稿，还未提交'
+  if (s === 'submitted' || s === 'pending_approval') return '等待审批人批准'
+  if (s === 'approved') return '等待放行并交给系统处理'
+  if (s === 'waiting_mapping') return '还差 IRS 采购单编号，请登记'
+  if (s === 'needs_review') return '需要人工检查，不会自动重试'
+  if (s === 'released' || s === 'in_progress') return '系统处理中，等待结果'
+  if (s === 'saved_unverified') return 'IRS 已尝试保存，等待核对'
+  if (s === 'verified') return 'IRS 已核对完成'
+  if (s === 'cancelled') return '已取消'
+  return ''
 }
 
-/** 收货事件列表：刷新/重开一律从 DB 读取（不依赖本地缓存） */
-export default function ReceiptListPage({ identity, caps }: { identity: GrIdentity; caps: GrCapabilities }) {
+/** 收货记录列表：刷新/重开一律从 DB 读取（不依赖本地缓存） */
+export default function ReceiptListPage({ caps }: { identity: GrIdentity; caps: GrCapabilities }) {
   const navigate = useNavigate()
   const [events, setEvents] = useState<GrReceiptEvent[]>([])
   const [loading, setLoading] = useState(true)
@@ -47,8 +56,8 @@ export default function ReceiptListPage({ identity, caps }: { identity: GrIdenti
         <div>
           <h1 className="text-2xl font-bold text-slate-900">收货记录</h1>
           <p className="text-sm text-slate-500">
-            收货事件（Receipt Event）。{caps.canApprove ? '你可以审批放行；' : ''}
-            员工日常只需填写数量、Invoice/DO、收货日期与差异备注。
+            {caps.canApprove ? '你可以审批并放行；' : ''}
+            员工日常只需填写数量、Invoice / DO、收货日期与差异备注。
           </p>
         </div>
         <button
@@ -80,6 +89,9 @@ export default function ReceiptListPage({ identity, caps }: { identity: GrIdenti
         <ul className="space-y-2">
           {events.map((ev) => {
             const badge = receiptStatusBadge(ev.status)
+            const hint = nextActionHint(ev)
+            const warnings = Array.isArray(ev.warnings) ? ev.warnings : []
+            const warningCodes = warnings.filter((w) => typeof w === 'string')
             return (
               <li key={ev.id}>
                 <button
@@ -93,31 +105,27 @@ export default function ReceiptListPage({ identity, caps }: { identity: GrIdenti
                         {ev.event_no || shortId(ev.id)}
                       </span>
                       <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${badge.cls}`}>{badge.label}</span>
-                      {/* receipt_list 摘要只返回 warnings/exception_count；review_required 只在详情返回 */}
-                      {Array.isArray(ev.warnings) && ev.warnings.length > 0 && (
+                      {warningCodes.length > 0 && (
                         <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
-                          警告 {ev.warnings.length}
+                          {warningCodes.map(warningLabel).join('、')}
                         </span>
                       )}
                       {typeof ev.exception_count === 'number' && ev.exception_count > 0 && (
                         <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">
-                          异常 {ev.exception_count}
+                          有 {ev.exception_count} 项需要确认
                         </span>
                       )}
-                      <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs text-slate-600">v{ev.revision ?? 0}</span>
                     </div>
                     <div className="mt-1 truncate text-sm text-slate-700">
-                      {(ev.po_ids ?? []).join(' + ') || '（无采购单编号）'}
-                      {ev.supplier_name ? ` · ${ev.supplier_name}` : ''}
+                      {ev.supplier_name ? `${ev.supplier_name}` : ''}
+                      {(ev.po_ids ?? []).length > 0 ? ` · 采购单 ${(ev.po_ids ?? []).join(' + ')}` : ''}
                     </div>
-                    <div className="mt-0.5 text-xs text-slate-400">
-                      收 {ev.receive_date ?? '—'}
-                      {ev.delivery_order_no ? ` · DO ${ev.delivery_order_no}` : ''}
-                      {ev.invoice_no ? ` · INV ${ev.invoice_no}` : ''}
-                      {ev.checked_by ? ` · 核对 ${ev.checked_by}` : ''}
-                      {ev.updated_at ? ` · ${fmt(ev.updated_at)}` : ''}
-                      {` · 操作人 ${identity.displayName || identity.email}`}
+                    <div className="mt-0.5 text-xs text-slate-500">
+                      收货日期 {ev.receive_date ?? '—'}
+                      {ev.delivery_order_no ? ` · 送货单 ${ev.delivery_order_no}` : ''}
+                      {ev.invoice_no ? ` · 发票 ${ev.invoice_no}` : ''}
                     </div>
+                    {hint && <div className="mt-1 text-xs text-slate-400">{hint}</div>}
                   </div>
                   <span className="text-xs font-semibold text-emerald-700">查看详情 →</span>
                 </button>
