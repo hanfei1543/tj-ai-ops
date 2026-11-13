@@ -15,7 +15,11 @@ import {
   receiptStatusBadge,
   validateReceiptForm,
 } from '@/lib/core/gr-form.js'
-import { buildReceiptAllocations, sumAllocationQty } from '@/lib/core/po-input.js'
+import {
+  assertOriginalSourcePoIds,
+  buildReceiptAllocations,
+  sumAllocationQty,
+} from '@/lib/core/po-input.js'
 import type { GrCapabilities, GrFormHeader, GrFormLine, ReceiptDraftSession } from '@/lib/core/gr-form.js'
 import type { GrIdentity } from '@/lib/grAuth'
 import type { PoWithLines } from '@/types/tjPo'
@@ -300,13 +304,16 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
   function currentPayload() {
     const session = sessionRef.current
     if (!session) throw new Error('草稿会话尚未就绪，请刷新后重试（不会重复建单）')
-    return buildReceiptSavePayload({
+    const payload = buildReceiptSavePayload({
       receiptId: session.receiptId,
       revision: session.revision,
       selectedPoIds: targetPoIds,
       header,
       lines,
     })
+    // 合并单自身不能当来源：来源未知时拒绝保存，等人工指定原始 PO
+    assertOriginalSourcePoIds(payload.po_ids, targets)
+    return payload
   }
 
   /** 保存草稿；遇到会话已有草稿/版本冲突时从服务端恢复 id/revision 后重试一次 */

@@ -94,3 +94,24 @@ export function sumAllocationQty(allocations) {
   }
   return addDecimalStrings(values)
 }
+
+/**
+ * 收货事件的 po_ids 必须全部是原始 PO：合并单自身（合成行）不能当来源。
+ * 合并行没有任何可核实 source_refs 时，fallback 会落到合并单 id —— 这里 fail closed。
+ * @param {string[]} poIds
+ * @param {Array<{id: string, po_type?: string|null}>} targets
+ */
+export function assertOriginalSourcePoIds(poIds, targets) {
+  const combined = new Set(
+    (Array.isArray(targets) ? targets : [])
+      .filter((t) => String(t?.po_type ?? 'standard') === 'combined')
+      .map((t) => String(t?.id ?? '')),
+  )
+  const bad = (Array.isArray(poIds) ? poIds : []).filter((id) => combined.has(String(id)))
+  if (bad.length > 0) {
+    throw new Error(
+      '收货来源必须是原始 PO：合并单自身不能作为 po_ids（未明来源拒绝保存，请人工指定来源）',
+    )
+  }
+  return true
+}

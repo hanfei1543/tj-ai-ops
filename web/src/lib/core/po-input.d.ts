@@ -41,3 +41,7 @@ export function buildReceiptAllocations(
   options?: { defaultAccepted?: boolean },
 ): GrFormAllocationInput[]
 export function sumAllocationQty(allocations: readonly { accepted_qty?: string }[]): string
+export function assertOriginalSourcePoIds(
+  poIds: readonly string[],
+  targets: readonly { id?: string | null; po_type?: string | null }[],
+): true

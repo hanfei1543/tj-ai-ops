@@ -109,8 +109,9 @@
 - 收货状态中文：`draft / submitted / approved / waiting_mapping / released / in_progress /
   saved_unverified / verified / needs_review / failed_unsaved / cancelled`；未知状态显示原始码，
   不冒充成功。**不虚构 `blocked` 状态**（服务端没有该事件状态）。
-- 列表/详情只用服务端真实字段：`review_required`、`warnings`、`exceptions`、`exception_count`；
-  不读 `needs_review`（布尔）、`po_numbers`、`status_reason`、表头旧 `irs_po_no/irs_grn_no`。
+- 列表/详情只用服务端真实字段：列表摘要用 `warnings`/`exception_count`，详情用
+  `review_required`/`warnings`/`exceptions`；不读 `needs_review`（布尔）、`po_numbers`、
+  `status_reason`、表头旧 `irs_po_no/irs_grn_no`。
 - **IRS 实际编号只来自任务回报** `tasks[].irs_po_no / irs_grn_no`，并标注仍需人工核对过账；
   表头历史 IRS 值不是放行/过账结果。
 - 任务状态（`ready/claimed/save_attempted/saved_unverified/verified/needs_review/...`）全部

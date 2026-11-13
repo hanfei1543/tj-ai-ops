@@ -21,6 +21,7 @@ import {
   validateReceiptForm,
 } from '../web/src/lib/core/gr-form.js'
 import {
+  assertOriginalSourcePoIds,
   buildReceiptAllocations,
   sumAllocationQty,
   toPoLineInputs,
@@ -183,6 +184,13 @@ test('普通单来源 = 该 PO 行；零实收不会被静默改成满额', () =
   const zero = buildReceiptAllocations(po, l, { defaultAccepted: true })
   zero[0].accepted_qty = '0'
   assert.equal(sumAllocationQty(zero), '0')
+})
+
+test('合并单自身不能出现在 po_ids（来源未明时 fail closed，不冒充原始 PO）', () => {
+  const targets = [{ id: UUID, po_type: 'combined' }, { id: UUID2, po_type: 'standard' }]
+  assert.equal(assertOriginalSourcePoIds([UUID3], targets), true)
+  assert.throws(() => assertOriginalSourcePoIds([UUID], targets), /必须是原始 PO/)
+  assert.throws(() => assertOriginalSourcePoIds([UUID3, UUID], targets), /拒绝保存/)
 })
 
 // ---------------------------------------------------------------------------

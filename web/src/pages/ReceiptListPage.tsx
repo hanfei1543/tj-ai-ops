@@ -93,9 +93,7 @@ export default function ReceiptListPage({ identity, caps }: { identity: GrIdenti
                         {ev.event_no || shortId(ev.id)}
                       </span>
                       <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${badge.cls}`}>{badge.label}</span>
-                      {ev.review_required && (
-                        <span className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">需复核</span>
-                      )}
+                      {/* receipt_list 摘要只返回 warnings/exception_count；review_required 只在详情返回 */}
                       {Array.isArray(ev.warnings) && ev.warnings.length > 0 && (
                         <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
                           警告 {ev.warnings.length}
