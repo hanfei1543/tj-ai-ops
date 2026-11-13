@@ -5,7 +5,6 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
-  Download,
   GripVertical,
   Loader2,
   Plus,
@@ -18,10 +17,10 @@ import {
   getItemByCode,
   getPo,
   getPosByIds,
+  IS_PREVIEW_SCHEMA,
   probeWebsitePoDateColumn,
   submitCombinedForApproval,
 } from '@/lib/tjPoApi'
-import { downloadGrExcel } from '@/lib/tjPoExcel'
 import { buildCombinedLines } from '@/lib/core/combine.js'
 import type { PoWithLines, SourceRef } from '@/types/tjPo'
 
@@ -66,6 +65,8 @@ export default function CombinePoPage() {
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const ids = useMemo(() => (params.get('ids') ?? '').split(',').filter(Boolean), [params])
+  const restoreId = params.get('id')
+  const isRestored = !!restoreId
 
   const [sourcePos, setSourcePos] = useState<PoWithLines[]>([])
   const [lines, setLines] = useState<CombineLine[]>([])
@@ -75,6 +76,8 @@ export default function CombinePoPage() {
 
   // 阶段：building（核对调整）→ pending_approval（待审批）→ confirmed（已冻结）
   const [phase, setPhase] = useState<'building' | 'pending_approval' | 'confirmed'>('building')
+  // 按 ID 恢复的合并单只读：合同没有 combine_update，不能假装本地改动已保存
+  const canEditLines = phase === 'building' && !isRestored
   const [combinedPoId, setCombinedPoId] = useState<string | null>(null)
   const [combinedPoNumber, setCombinedPoNumber] = useState('')
 
@@ -95,8 +98,51 @@ export default function CombinePoPage() {
     linesRef.current = lines
   }, [lines])
 
+  // 已有合并单：按 ID 恢复/查看（冻结字段不重写，只按 status 展示/继续）
   useEffect(() => {
     let mounted = true
+    if (restoreId) {
+      getPo(restoreId)
+        .then((po) => {
+          if (!mounted) return
+          if (po.po_type !== 'combined') {
+            setError(`${po.po_id} 不是合并单，不能按合并单打开`)
+            return
+          }
+          setSourcePos([po])
+          setCombinedPoId(po.id)
+          setCombinedPoNumber(po.po_id)
+          setWebsitePoDate(po.website_po_date ?? '')
+          setCheckedBy(po.checked_by ?? '')
+          setDeliveryOrderNo(po.delivery_order_no ?? '')
+          setPhase(
+            po.status === 'confirmed'
+              ? 'confirmed'
+              : po.status === 'pending_approval'
+                ? 'pending_approval'
+                : 'building',
+          )
+          setLines(
+            (po.lines ?? []).map((l) => ({
+              key: nextKey(),
+              item_code: l.item_code,
+              description: l.description,
+              uom: l.uom ?? null,
+              unit_price: Number(l.unit_price),
+              ordered_qty: Number(l.original_qty ?? l.qty),
+              accepted_qty: String(l.accepted_qty ?? l.qty ?? ''),
+              note: l.note ?? '',
+              source_refs: (l.source_refs ?? []) as SourceRef[],
+              is_extra: (l.source_refs ?? []).length === 0,
+            })),
+          )
+        })
+        .catch((e) => mounted && setError(e.message))
+        .finally(() => mounted && setLoading(false))
+      return () => {
+        mounted = false
+      }
+    }
     if (ids.length === 0) {
       setError('未选择要合并的采购单')
       setLoading(false)
@@ -127,7 +173,7 @@ export default function CombinePoPage() {
     return () => {
       mounted = false
     }
-  }, [ids])
+  }, [ids, restoreId])
 
   // 日期列是否已随迁移上线（未上线时提示：填了也不会保存，导出仍需补录）
   useEffect(() => {
@@ -142,6 +188,9 @@ export default function CombinePoPage() {
 
   const supplierName = sourcePos[0]?.supplier_name ?? ''
   const supplierCode = sourcePos[0]?.supplier_code ?? ''
+  const sourceLabels = isRestored
+    ? (sourcePos[0]?.source_po_ids ?? [])
+    : sourcePos.map((p) => p.po_id)
 
   function updateLine(key: string, patch: Partial<CombineLine>) {
     setLines((ls) => ls.map((l) => (l.key === key ? { ...l, ...patch } : l)))
@@ -231,8 +280,16 @@ export default function CombinePoPage() {
     setBusy(true)
     setError('')
     try {
-      const supplier = { id: '', code: supplierCode, name: supplierName }
-      const header = await createCombinedPo(supplier, sourcePos, input, creator, date)
+      // 从 DB 按 ID 恢复的合并单：直接提交已存在的草稿（不重新建单，避免重复）
+      const header = combinedPoId
+        ? { id: combinedPoId, po_id: combinedPoNumber }
+        : await createCombinedPo(
+            { id: '', code: supplierCode, name: supplierName },
+            sourcePos,
+            input,
+            creator,
+            date,
+          )
       await submitCombinedForApproval(header.id, checkedBy || creator, deliveryOrderNo)
       setCombinedPoId(header.id)
       setCombinedPoNumber(header.po_id)
@@ -278,20 +335,7 @@ export default function CombinePoPage() {
     }
   }
 
-  // 导出 GR 收货数据包（receipt_event_id + DO No + 批准快照 + 实收明细）
-  async function handleExportGr() {
-    if (!combinedPoId) return
-    setBusy(true)
-    setError('')
-    try {
-      const po = await getPo(combinedPoId)
-      await downloadGrExcel(po, po.lines)
-    } catch (e: any) {
-      setError(e.message || '导出收货单失败')
-    } finally {
-      setBusy(false)
-    }
-  }
+  // 导出 GR 收货数据包已从员工界面移除（Excel 下载入口停用）；内部生成函数保留在 lib/tjPoExcel。
 
   if (loading) {
     return (
@@ -348,7 +392,7 @@ export default function CombinePoPage() {
             <div className="text-right">
               <div className="text-xs text-slate-400">来源采购单</div>
               <div className="font-mono text-sm font-semibold text-slate-700">
-                {sourcePos.map((p) => p.po_id).join(' + ')}
+                {sourceLabels.join(' + ') || '—'}
               </div>
             </div>
           </div>
@@ -365,11 +409,18 @@ export default function CombinePoPage() {
           )}
         </div>
 
+        {isRestored && (
+          <div className="mb-4 rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs text-slate-600">
+            已按 ID 从数据库恢复合并单 {combinedPoNumber}：冻结字段只读，不通过普通编辑器改写；
+            合并行内容以数据库为准（合同无 combine_update）。
+          </div>
+        )}
+
         {/* 明细表 */}
         <section className="mb-5">
           <div className="mb-2 flex items-center justify-between">
             <label className="text-sm font-medium text-slate-600">合并明细（可调整顺序与实收数量）</label>
-            {phase === 'building' && (
+            {canEditLines && (
               <button
                 type="button"
                 onClick={addExtraLine}
@@ -420,7 +471,7 @@ export default function CombinePoPage() {
                 >
                   {/* 把手 */}
                   <div className="flex w-8 shrink-0 flex-col items-center justify-center gap-1 rounded-l-xl border-r border-slate-100 bg-slate-50 py-2">
-                    {phase === 'building' ? (
+                    {canEditLines ? (
                       <>
                         <button
                           type="button"
@@ -465,7 +516,7 @@ export default function CombinePoPage() {
                   {/* 内容 */}
                   <div className="grid flex-1 grid-cols-[1fr_1fr_auto_auto] gap-2 p-3 md:grid-cols-[1fr_1.6fr_70px_80px_80px_90px_1.2fr_36px] md:items-center">
                     {/* 编号 */}
-                    {l.is_extra && phase === 'building' ? (
+                    {l.is_extra && canEditLines ? (
                       <input
                         value={l.item_code}
                         onChange={(e) => updateLine(l.key, { item_code: e.target.value })}
@@ -478,7 +529,7 @@ export default function CombinePoPage() {
                     )}
 
                     {/* 描述 */}
-                    {l.is_extra && phase === 'building' ? (
+                    {l.is_extra && canEditLines ? (
                       <input
                         value={l.description}
                         onChange={(e) => updateLine(l.key, { description: e.target.value })}
@@ -499,7 +550,7 @@ export default function CombinePoPage() {
                     </div>
 
                     {/* 实收（可编辑） */}
-                    {phase === 'building' ? (
+                    {canEditLines ? (
                       <input
                         value={l.accepted_qty}
                         onChange={(e) => updateLine(l.key, { accepted_qty: e.target.value })}
@@ -519,7 +570,7 @@ export default function CombinePoPage() {
                     </div>
 
                     {/* 备注 */}
-                    {phase === 'building' ? (
+                    {canEditLines ? (
                       <input
                         value={l.note}
                         onChange={(e) => updateLine(l.key, { note: e.target.value })}
@@ -531,7 +582,7 @@ export default function CombinePoPage() {
                     )}
 
                     {/* 删除（仅额外行可删） */}
-                    {phase === 'building' && l.is_extra ? (
+                    {canEditLines && l.is_extra ? (
                       <div className="flex justify-end">
                         <button type="button" onClick={() => removeLine(l.key)} className="rounded-lg p-1.5 text-slate-300 hover:bg-red-50 hover:text-red-500" aria-label="删除">
                           <Trash2 className="h-4 w-4" />
@@ -558,7 +609,8 @@ export default function CombinePoPage() {
                 type="date"
                 value={websitePoDate}
                 onChange={(e) => setWebsitePoDate(e.target.value)}
-                className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+                disabled={isRestored}
+                className="w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 disabled:bg-slate-50"
               />
               <p className="mt-1 text-xs text-slate-500">
                 由开单人或核对人选择日期（yyyy-MM-dd），不是创建、收货或审批日期，不默认当天；批准后随明细冻结。
@@ -640,11 +692,12 @@ export default function CombinePoPage() {
               <>
                 <button
                   type="button"
-                  onClick={handleExportGr}
-                  disabled={busy}
+                  onClick={() => navigate(`/tj-po-system/receipts/new?po_ids=${combinedPoId}`)}
+                  disabled={!IS_PREVIEW_SCHEMA || !combinedPoId}
+                  title={IS_PREVIEW_SCHEMA ? '登记本次收货（预览环境，需登录）' : '统一收货只在预览环境启用'}
                   className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-4 py-2.5 text-sm font-semibold text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
                 >
-                  <Download className="h-4 w-4" /> 导出收货单 (内部 Excel，不推送 IRS)
+                  登记本次收货
                 </button>
                 <button
                   type="button"

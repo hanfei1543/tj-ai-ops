@@ -1,5 +1,6 @@
 // TJ PO 系统数据访问层：独立 Supabase client（内部工具，匿名访问，RLS 已放行 anon）
-import { createClient } from '@supabase/supabase-js'
+// Preview（tj_preview）下旧 PO 修复路径改走 tj_gr_api 的 po_save / combine_* RPC（事务稳定行 id）；
+// 生产 public 路径保持原 REST 写法不变。
 import type {
   CombinedLineInput,
   Item,
@@ -11,24 +12,16 @@ import type {
   Supplier,
 } from '@/types/tjPo'
 import { ADD_ITEM_WRITES_ENABLED } from './featureFlags'
+import { combineApprove, combineCancel, combineCreate, combineSubmit, poSave } from './tjGrApi'
+import { IS_PREVIEW_SCHEMA, supabase as db } from './supabaseClient'
 import {
   approveCombinedPoFlow,
   submitCombinedForApprovalFlow,
 } from './core/approve-flow.js'
 import { formatWebsitePoDate } from './core/po-lines.js'
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+export { IS_PREVIEW_SCHEMA }
 
-// 独立 client，不套用 DYT 的 Database 泛型（tj_* 表不在其中）
-// VITE_SUPABASE_SCHEMA 仅 Preview 隔离环境设置（=tj_preview）；生产不设则走 public。
-const DB_SCHEMA = import.meta.env.VITE_SUPABASE_SCHEMA || 'public'
-const db = createClient(supabaseUrl, supabaseAnonKey, {
-  db: { schema: DB_SCHEMA },
-})
-
-/** 预览隔离环境（tj_preview）：禁止任何推送动作，推送只允许生产 public 发起 */
-export const IS_PREVIEW_SCHEMA = DB_SCHEMA !== 'public'
 
 /** 去掉 ilike 通配符/转义字符，防止用户输入破坏查询 */
 function clean(q: string): string {
@@ -121,12 +114,54 @@ export async function getPosByIds(ids: string[]): Promise<PoWithLines[]> {
   return result
 }
 
-/** 新建 PO：写表头 + 明细（单事务由两次写入组成；MVP 接受，失败靠前端重试） */
+/** po_save 返回值归一（不同后端可能在 po/event/header 里包一层）；id 必须存在且与预期一致 */
+function poHeaderFromRpc(res: unknown, expectedId: string | null): PoHeader {
+  const r = res as Record<string, any> | null
+  const header = r?.po ?? r?.po_header ?? r?.event ?? r?.header ?? r?.data ?? r
+  const id = header?.id
+  if (typeof id !== 'string' || !id) {
+    throw new Error('po_save 未返回 PO id：拒绝当作保存成功（请刷新核对，勿重复保存）')
+  }
+  if (expectedId && id !== expectedId) {
+    throw new Error(`po_save 返回了不同的 PO id（${id} ≠ ${expectedId}）：拒绝覆盖原单`)
+  }
+  return header as PoHeader
+}
+
+function poSaveLines(lines: PoLine[]) {
+  return lines.map((l, i) => ({
+    // 已存在的行带上原 id：事务内原地更新，行 id 稳定（不删行重插）
+    id: l.id ?? null,
+    line_no: l.line_no ?? i + 1,
+    item_code: l.item_code,
+    description: l.description,
+    uom: l.uom ?? null,
+    qty: String(l.qty),
+    unit_price: String(l.unit_price),
+  }))
+}
+
+/** 新建 PO：Preview 走 po_save RPC（事务 + 稳定行 id + 幂等 request_id）；生产保持原两次写入 */
 export async function createPo(
   supplier: Supplier,
   lines: PoLine[],
-  createdBy: string
+  createdBy: string,
+  notes: string | null = null,
+  requestId: string = crypto.randomUUID()
 ): Promise<PoHeader> {
+  if (IS_PREVIEW_SCHEMA) {
+    const res = await poSave({
+      id: null,
+      request_id: requestId,
+      supplier_code: supplier.code,
+      supplier_name: supplier.name,
+      notes: notes ?? null,
+      created_by: createdBy,
+      lines: poSaveLines(lines),
+    })
+    return poHeaderFromRpc(res, null)
+  }
+
   const { data: header, error: he } = await db
     .from('tj_po_headers')
     .insert({
@@ -156,12 +191,29 @@ export async function createPo(
   return header as PoHeader
 }
 
-/** 更新 PO：替换明细（删旧行 + 插新行） */
+/** 更新 PO：Preview 走 po_save（保留原 id + 原行 id）；生产保持「删旧行重插」旧路径 */
 export async function updatePo(
   id: string,
   supplier: Supplier,
-  lines: PoLine[]
+  lines: PoLine[],
+  notes: string | null = null,
+  requestId: string = crypto.randomUUID(),
+  createdBy: string | null = null
 ): Promise<PoHeader> {
+  if (IS_PREVIEW_SCHEMA) {
+    const res = await poSave({
+      id,
+      request_id: requestId,
+      supplier_code: supplier.code,
+      supplier_name: supplier.name,
+      notes: notes ?? null,
+      // 服务端更新时保留原表头 created_by；这里传当前开单人只作为要求字段占位
+      created_by: createdBy ?? '',
+      lines: poSaveLines(lines),
+    })
+    return poHeaderFromRpc(res, id)
+  }
+
   const { error: he } = await db
     .from('tj_po_headers')
     .update({
@@ -302,7 +354,18 @@ export async function probeWebsitePoDateColumn(): Promise<boolean> {
   return websitePoDateColumnSupported
 }
 
+function combineEventFromRpc(res: unknown, action: string): Record<string, any> {
+  const r = res as Record<string, any> | null
+  const ev = r?.event ?? r?.po ?? r?.po_header ?? r?.header ?? r?.data ?? r
+  if (!ev || typeof ev !== 'object' || typeof ev.id !== 'string' || !ev.id) {
+    throw new Error(`${action} 未返回事件 id：拒绝当作成功（请刷新核对，勿重复提交）`)
+  }
+  return ev as Record<string, any>
+}
+
 /** 创建合并单：header po_type=combined + status=draft，明细带来源追溯；来源 PO 置 combining 锁定
+ *
+ * Preview：走 combine_create RPC（source_ids 用 uuid，后端不足时直接报错，不做多 REST 回退）。
  *
  * website_po_date 为开单/核对人显式选择的业务日期（yyyy-MM-dd），提交审批必需。
  * 日期缺失、格式非法、或数据库尚未启用该列时一律 fail closed 抛错——绝不静默跳过日期继续建单，
@@ -313,7 +376,8 @@ export async function createCombinedPo(
   sourceHeaders: PoHeader[],
   lines: CombinedLineInput[],
   createdBy: string,
-  websitePoDate?: string | null
+  websitePoDate?: string | null,
+  requestId: string = crypto.randomUUID()
 ): Promise<PoHeader> {
   // 先做纯校验（格式非法直接抛出，不触碰数据库）
   const date = formatWebsitePoDate(websitePoDate)
@@ -323,6 +387,27 @@ export async function createCombinedPo(
         '系统不默认当天，也不用创建/收货/审批时间代替。'
     )
   }
+  if (IS_PREVIEW_SCHEMA) {
+    const res = await combineCreate({
+      request_id: requestId,
+      source_ids: sourceHeaders.map((p) => p.id),
+      website_po_date: date,
+      created_by: createdBy,
+      lines: lines.map((l) => ({
+        item_code: l.item_code,
+        description: l.description,
+        uom: l.uom,
+        qty: l.qty,
+        unit_price: l.unit_price,
+        original_qty: l.original_qty,
+        accepted_qty: l.accepted_qty,
+        note: l.note ?? null,
+        source_refs: l.source_refs,
+      })),
+    })
+    return combineEventFromRpc(res, 'combine_create') as unknown as PoHeader
+  }
+
   // 迁移未应用时不能保存日期：直接阻止合并，不允许"跳过日期继续审批"
   if (!(await probeWebsitePoDateColumn())) {
     throw new Error(
@@ -471,6 +556,18 @@ export async function submitCombinedForApproval(
   checkedBy: string,
   deliveryOrderNo?: string
 ): Promise<void> {
+  if (IS_PREVIEW_SCHEMA) {
+    const ev = combineEventFromRpc(
+      await combineSubmit({ id, checked_by: checkedBy, delivery_order_no: deliveryOrderNo ?? null }),
+      'combine_submit'
+    )
+    if (ev.status !== 'pending_approval') {
+      throw new Error(
+        `combine_submit 返回状态 ${ev.status ?? '未知'}（不是 pending_approval）：请刷新核对，勿重复提交`
+      )
+    }
+    return
+  }
   await submitCombinedForApprovalFlow({
     io: combinedApproveIo,
     id,
@@ -487,11 +584,29 @@ export async function submitCombinedForApproval(
  * 读回失败/摘要不一致/来源单 0 行一律报错，绝不当成功。
  */
 export async function approveCombinedPo(id: string, approvedBy: string): Promise<void> {
+  if (IS_PREVIEW_SCHEMA) {
+    const ev = combineEventFromRpc(
+      await combineApprove({ id, approved_by: approvedBy }),
+      'combine_approve'
+    )
+    if (ev.status !== 'confirmed' || ev.frozen !== true) {
+      throw new Error(
+        `combine_approve 返回 status=${ev.status ?? '未知'} / frozen=${String(ev.frozen)}：` +
+          '不是已批准冻结，请立即人工核对（不要重复批准）'
+      )
+    }
+    return
+  }
   await approveCombinedPoFlow({ io: combinedApproveIo, id, approvedBy })
 }
 
 /** 取消合并（仅未批准前）：删除合并单 + 恢复来源 PO 为 confirmed */
 export async function cancelCombinedPo(id: string): Promise<void> {
+  if (IS_PREVIEW_SCHEMA) {
+    // Preview：服务端事务内校验「未批准」并恢复来源单；客户端不做多 REST 拼接
+    combineEventFromRpc(await combineCancel({ id }), 'combine_cancel')
+    return
+  }
   const { data: hdr, error: he } = await db
     .from('tj_po_headers')
     .select('status, frozen, source_po_ids')

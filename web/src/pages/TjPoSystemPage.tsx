@@ -307,6 +307,7 @@ function PoList({
   onEdit: (id: string) => void
   onCombine: (ids: string[]) => void
 }) {
+  const navigate = useNavigate()
   const [pos, setPos] = useState<PoHeader[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -387,6 +388,18 @@ function PoList({
             <h1 className="text-2xl font-bold leading-tight text-slate-900">采购单</h1>
             <p className="text-sm font-medium text-slate-500">Purchase Order</p>
             <p className="mt-1 text-sm text-slate-500">建立采购单、导出 Excel 交给 PAD 录入 IRS</p>
+            {IS_PREVIEW_SCHEMA && (
+              <p className="mt-1 text-xs text-amber-600">
+                预览环境：保存 PO / 登记收货需要登录身份 →
+                <button
+                  type="button"
+                  onClick={() => navigate('/tj-po-system/receipts')}
+                  className="ml-1 font-semibold underline"
+                >
+                  收货中心登录
+                </button>
+              </p>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <button
@@ -470,7 +483,13 @@ function PoList({
                   )}
                   <button
                     type="button"
-                    onClick={() => (combineMode ? toggleSelect(p) : onEdit(p.id))}
+                    onClick={() =>
+                      combineMode
+                        ? toggleSelect(p)
+                        : p.po_type === 'combined'
+                          ? navigate(`/tj-po-system/combine?id=${p.id}`)
+                          : onEdit(p.id)
+                    }
                     disabled={notCombinable}
                     className="min-w-0 flex-1 text-left"
                   >
@@ -497,6 +516,21 @@ function PoList({
                       已冻结·不可推送
                     </span>
                   )}
+                  {!combineMode && p.status === 'confirmed' && (
+                    <button
+                      type="button"
+                      onClick={() => navigate(`/tj-po-system/receipts/new?po_ids=${p.id}`)}
+                      disabled={!IS_PREVIEW_SCHEMA}
+                      title={
+                        IS_PREVIEW_SCHEMA
+                          ? '登记本次收货（预览环境，需登录）'
+                          : '统一收货只在预览环境启用（生产 GR 入口硬禁用）'
+                      }
+                      className="shrink-0 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      登记本次收货
+                    </button>
+                  )}
                   {!combineMode && p.status === 'confirmed' && p.po_type !== 'combined' && !combinedSourcePoNumbers.has(p.po_id) && !IS_PREVIEW_SCHEMA && (
                     <button
                       type="button"
@@ -505,7 +539,7 @@ function PoList({
                       className="flex shrink-0 items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
                     >
                       {exportingId === p.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
-                      推送到电脑
+                      发送采购 PO 到电脑
                     </button>
                   )}
                 </li>
@@ -531,6 +565,7 @@ function PoEditor({
   onBack: () => void
   onSaved: () => void
 }) {
+  const navigate = useNavigate()
   const [supplier, setSupplier] = useState<Supplier | null>(null)
   const [lines, setLines] = useState<EditableLine[]>([emptyLine()])
   const [notes, setNotes] = useState('')
@@ -542,8 +577,12 @@ function PoEditor({
   const [createdBy, setCreatedBy] = useState<string | null>(null)
   const [showPersonPicker, setShowPersonPicker] = useState(false)
   const [frozen, setFrozen] = useState(false)
+  const [poStatus, setPoStatus] = useState('')
+  const [poType, setPoType] = useState('standard')
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const [dropIndex, setDropIndex] = useState<number | null>(null)
+  // po_save 幂等键：同一编辑会话重试不会重复建单
+  const poRequestId = useRef<string>(crypto.randomUUID())
 
   const lineRefs = useRef<Record<string, { item: HTMLInputElement | null; qty: HTMLInputElement | null; price: HTMLInputElement | null }>>({})
 
@@ -572,6 +611,8 @@ function PoEditor({
         )
         setCreatedBy(po.created_by ?? null)
         setFrozen(!!po.frozen)
+        setPoStatus(po.status)
+        setPoType(po.po_type || 'standard')
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
@@ -674,6 +715,8 @@ function PoEditor({
       }
     }
     return valid.map((l, i) => ({
+      // 保留已保存行的 uuid id：Preview 的 po_save 靠它稳定行（不删行重插）
+      id: l.lineId,
       line_no: i + 1,
       item_code: l.item!.code,
       description: l.item!.description,
@@ -683,19 +726,28 @@ function PoEditor({
     }))
   }
 
+  const locked = poType === 'combined' && frozen
+
   async function doSave(by?: string): Promise<PoHeader | null> {
+    if (locked) {
+      setError('已批准冻结的合并单不能在普通编辑器保存：请用合并单页面按 ID 查看')
+      return null
+    }
     const parsed = buildLines()
     if (!parsed) return null
     setSaving(true)
     setError('')
     try {
       if (savedPoId) {
-        const po = await updatePo(savedPoId, supplier!, parsed)
+        const po = await updatePo(savedPoId, supplier!, parsed, notes, poRequestId.current, createdBy)
         setSavedPoId(po.id)
+        setPoStatus(po.status)
+        setFrozen(!!po.frozen)
         return po
       }
-      const po = await createPo(supplier!, parsed, by ?? createdBy ?? '')
+      const po = await createPo(supplier!, parsed, by ?? createdBy ?? '', notes, poRequestId.current)
       setSavedPoId(po.id)
+      setPoStatus(po.status)
       return po
     } catch (e: any) {
       setError(e.message || '保存失败')
@@ -777,6 +829,34 @@ function PoEditor({
 
         {error && (
           <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
+        )}
+
+        {locked && (
+          <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            该合并单已批准冻结：普通编辑器只读，不能在这里保存（会破坏冻结字段）。
+            <button
+              type="button"
+              onClick={() => navigate(`/tj-po-system/combine?id=${savedPoId}`)}
+              className="ml-2 font-semibold underline"
+            >
+              打开合并单页面查看
+            </button>
+          </div>
+        )}
+
+        {savedPoId && poStatus === 'confirmed' && (
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
+            <span className="text-sm text-emerald-800">这张采购单已确认：收货请走「登记本次收货」，不要在这里改数量。</span>
+            <button
+              type="button"
+              onClick={() => navigate(`/tj-po-system/receipts/new?po_ids=${savedPoId}`)}
+              disabled={!IS_PREVIEW_SCHEMA}
+              title={IS_PREVIEW_SCHEMA ? '' : '统一收货只在预览环境启用'}
+              className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
+            >
+              登记本次收货
+            </button>
+          </div>
         )}
 
         {/* 供应商 */}
@@ -877,7 +957,7 @@ function PoEditor({
               {copied ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4" />}
               {copied ? '已复制' : '复制给Supplier'}
             </button>
-            {savedPoId && (
+            {savedPoId && !locked && (
               <button
                 type="button"
                 onClick={handleDelete}
@@ -890,7 +970,7 @@ function PoEditor({
           <button
             type="button"
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || locked}
             className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-6 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
           >
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
