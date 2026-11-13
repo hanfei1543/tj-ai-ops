@@ -57,7 +57,7 @@ export default function ReceiptListPage({ caps }: { identity: GrIdentity; caps: 
           <h1 className="text-2xl font-bold text-slate-900">收货记录</h1>
           <p className="text-sm text-slate-500">
             {caps.canApprove ? '你可以审批并放行；' : ''}
-            员工日常只需填写数量、Invoice / DO、收货日期与差异备注。
+            员工日常只需填写数量、发票 / 送货单、收货日期与差异备注。
           </p>
         </div>
         <button

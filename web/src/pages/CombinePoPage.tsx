@@ -155,7 +155,7 @@ export default function CombinePoPage() {
         // 校验相同供应商
         const codes = new Set(pos.map((p) => p.supplier_code))
         if (codes.size !== 1) {
-          setError('只能合并相同 Supplier Code 的采购单')
+          setError('只能合并相同供应商编号的采购单')
           setLoading(false)
           return
         }
@@ -628,7 +628,7 @@ export default function CombinePoPage() {
               </p>
             </div>
             <div>
-              <label className="mb-1.5 block text-sm font-medium text-slate-600">Delivery Order No.（送货单号，可选）</label>
+              <label className="mb-1.5 block text-sm font-medium text-slate-600">送货单号（可选）</label>
               <input
                 value={deliveryOrderNo}
                 onChange={(e) => setDeliveryOrderNo(e.target.value)}

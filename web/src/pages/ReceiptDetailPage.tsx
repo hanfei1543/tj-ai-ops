@@ -125,7 +125,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
     }
     if (!documentNumbersPresent(event)) {
       setError(
-        '放行前必须至少有一项 Invoice No. 或 Delivery Order No.（两者都空只能存草稿）：请先补充并重新提交',
+        '放行前必须至少有一项发票号码或送货单号（两者都空只能存草稿）：请先补充并重新提交',
       )
       return
     }
@@ -317,8 +317,8 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
           <Field label="来源采购单">{(event.po_ids ?? []).join(' + ') || '—'}</Field>
           <Field label="供应商">{event.supplier_name ? `${event.supplier_code ?? ''} ${event.supplier_name}` : '—'}</Field>
           <Field label="收货日期">{event.receive_date ?? '—'}</Field>
-          <Field label="Invoice No.">{event.invoice_no || '—'}</Field>
-          <Field label="Delivery Order">{event.delivery_order_no || '—'}</Field>
+          <Field label="发票号码">{event.invoice_no || '—'}</Field>
+          <Field label="送货单号">{event.delivery_order_no || '—'}</Field>
           <Field label="发票日期">{event.invoice_date || '—'}</Field>
           <Field label="核对人（登录身份）">{event.checked_by || '—'}</Field>
           <Field label="审批人">{event.approved_by || '—'}</Field>
@@ -328,7 +328,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
           <Field label="备注">{event.note || '—'}</Field>
         </dl>
         <p className="mt-2 text-[11px] text-slate-400">
-          放行条件：Invoice No. 与 Delivery Order No. 至少一项（号码原样保存）；两者都空只能存草稿。
+          放行条件：发票号码与送货单号至少一项（号码原样保存）；两者都空只能存草稿。
           IRS 实际编号以本机任务回报为准，不读表头旧值。
         </p>
       </section>

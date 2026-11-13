@@ -99,7 +99,7 @@ const CREATED_BY_OPTIONS = ['Ms Toh', 'Ngam Cheng Jye', 'Keh Lee', 'Ms Teow', 'A
 
 /** 把 PO 内容格式化成可复制的订货单（给供应商）：只写商品名 + 数量 + 单位，不写编号和单价 */
 function buildCopyText(lines: EditableLine[]): string {
-  const parts: string[] = [`Order (${ORDER_FROM})`, '']
+  const parts: string[] = [`订货单 (${ORDER_FROM})`, '']
   lines.forEach((l, i) => {
     if (!l.item) return
     const qty = parseFloat(l.qty) || 0
@@ -374,7 +374,7 @@ function PoList({
     }
     const already = pos.find((x) => selected.has(x.id))
     if (already && already.supplier_code !== p.supplier_code) {
-      setError('只能合并相同 Supplier Code 的采购单')
+      setError('只能合并相同供应商编号的采购单')
       return
     }
     const next = new Set(selected)
@@ -441,7 +441,7 @@ function PoList({
 
         {combineMode && (
           <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3">
-            <span className="text-sm text-emerald-800">合并模式：勾选两张以上相同 Supplier、尚未推送的采购单</span>
+            <span className="text-sm text-emerald-800">合并模式：勾选两张以上相同供应商、尚未推送的采购单</span>
             <button
               type="button"
               onClick={handleCombine}
@@ -1055,7 +1055,7 @@ function PoEditor({
               className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
             >
               {copied ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4" />}
-              {copied ? '已复制' : '复制给Supplier'}
+              {copied ? '已复制' : '复制给供应商'}
             </button>
             {savedPoId && !locked && (
               <button

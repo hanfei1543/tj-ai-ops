@@ -391,7 +391,7 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
     }
     if (release && !documentNumbersPresent(header)) {
       setError(
-        '放行前必须至少填写 Invoice No. 或 Delivery Order No.（IRS 发票号以 Invoice No. 为准，号码原样保存；两者都空只能存草稿）',
+        '放行前必须至少填写发票号码或送货单号（IRS 发票号以发票号码为准，号码原样保存；两者都空只能存草稿）',
       )
       return
     }
@@ -430,7 +430,7 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
           throw new Error('存在异常：放行必须填写复核说明（review_note）')
         }
         if (!documentNumbersPresent(header)) {
-          throw new Error('放行前必须至少填写 Invoice No. 或 Delivery Order No.（合同要求，不能都空）')
+          throw new Error('放行前必须至少填写发票号码或送货单号（合同要求，不能都空）')
         }
         const approved = await approveReceipt({
           id: submitted.id,
@@ -570,7 +570,7 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
       <section className="mb-4 rounded-2xl border border-slate-200 bg-white p-4">
         <div className="grid gap-3 md:grid-cols-3">
           <label className="block text-xs font-medium text-slate-600">
-            Invoice No.（IRS 发票号，原样保存）
+            发票号码（IRS 发票号，原样保存）
             <input
               value={header.invoice_no}
               onChange={(e) => updateHeader({ invoice_no: e.target.value })}
@@ -579,7 +579,7 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
             />
           </label>
           <label className="block text-xs font-medium text-slate-600">
-            Delivery Order No.
+            送货单号
             <input
               value={header.delivery_order_no}
               onChange={(e) => updateHeader({ delivery_order_no: e.target.value })}
@@ -627,7 +627,7 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
           </label>
         </div>
         <p className="mt-2 text-[11px] text-slate-400">
-          Invoice No. 与 Delivery Order No. 至少填写一项才能提交/放行；两者都空只能保存草稿。
+          发票号码与送货单号至少填写一项才能提交/放行；两者都空只能保存草稿。
           号码按原样保存（trim 只用于判空，不改写发票/送货单号）。
         </p>
       </section>
@@ -636,12 +636,12 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
       <section className="mb-4">
         <div className="mb-2 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-slate-700">收货明细（只需填实收数量）</h2>
-          <span className="text-xs text-slate-400">不同 Item / UOM / 单价不合并；单价只读</span>
+          <span className="text-xs text-slate-400">不同商品 / 单位 / 单价不合并；单价只读</span>
         </div>
         <div className="hidden grid-cols-[1.2fr_1.6fr_70px_90px_90px_1fr_1.2fr] gap-2 px-2 pb-1 text-xs text-slate-400 md:grid">
           <span>商品编号</span>
           <span>描述</span>
-          <span>UOM</span>
+          <span>单位</span>
           <span className="text-right">订购</span>
           <span className="text-right">实收</span>
           <span className="text-right">单价</span>

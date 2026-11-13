@@ -374,10 +374,10 @@ export function validateReceiptForm({ header, lines, identity = null } = {}) {
   const requiresExceptionApproval = canSubmit && exceptions.length > 0
   let submitBlockedReason = ''
   if (!ok) submitBlockedReason = '请先修正表单错误'
-  else if (list.length === 0) submitBlockedReason = '没有收货行：只能保存草稿，不会形成正式 GR'
+  else if (list.length === 0) submitBlockedReason = '没有收货行：只能保存草稿，不会形成正式收货记录'
   else if (!hasDocumentNumber) {
     submitBlockedReason =
-      'Invoice No. 与 Delivery Order No. 至少填写一项才能提交/放行（两者都空只能保存草稿）'
+      '发票号码与送货单号至少填写一项才能提交/放行（两者都空只能保存草稿）'
   }
 
   return {
