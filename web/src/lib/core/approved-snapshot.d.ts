@@ -15,16 +15,16 @@ export interface SnapshotLineInput {
   item_code?: string | null
   description?: string | null
   uom?: string | null
-  qty?: number | null
-  original_qty?: number | null
-  accepted_qty?: number | null
-  unit_price?: number | null
+  qty?: number | string | null
+  original_qty?: number | string | null
+  accepted_qty?: number | string | null
+  unit_price?: number | string | null
   note?: string | null
   source_refs?: Array<{
     po_id?: string | null
     po_number?: string | null
     line_id?: string | null
-    qty?: number | null
+    qty?: number | string | null
   }> | null
 }
 

@@ -36,6 +36,7 @@ export interface GrTask {
   status: string
   po_header_id?: string | null
   irs_po_no?: string | null
+  irs_grn_no?: string | null
   payload_sha256?: string | null
   claimed_by?: string | null
   lease_expires_at?: string | null
@@ -44,9 +45,6 @@ export interface GrTask {
   verified_at?: string | null
   bridge_ok?: boolean | null
   last_error?: string | null
-  kind?: string | null
-  target?: string | null
-  message?: string | null
   created_at?: string | null
   updated_at?: string | null
 }
@@ -65,7 +63,6 @@ export interface GrReceiptEvent {
   status: string
   revision: number
   po_ids?: string[]
-  po_numbers?: string[]
   supplier_code?: string | null
   supplier_name?: string | null
   invoice_no?: string | null
@@ -76,7 +73,8 @@ export interface GrReceiptEvent {
   note?: string | null
   submitted_by?: string | null
   submitted_at?: string | null
-  needs_review?: boolean
+  /** 服务端真实字段：存在异常/疑似重复单时需要复核（不是 needs_review 事件状态） */
+  review_required?: boolean
   allow_exceptions?: boolean
   review_note?: string | null
   approved_by?: string | null
@@ -86,16 +84,11 @@ export interface GrReceiptEvent {
   warnings?: GrWarningOrException[] | string[]
   exceptions?: GrWarningOrException[]
   exception_count?: number
-  irs_po_no?: string | null
-  irs_grn_no?: string | null
   created_at?: string | null
   updated_at?: string | null
   lines?: GrReceiptLine[]
   tasks?: GrTask[]
-  /** 服务端真实状态原因（waiting_mapping / blocked 等） */
-  status_reason?: string | null
   missing_mappings?: string[]
-  remaining?: unknown
 }
 
 export type { GrSourceAllocation }

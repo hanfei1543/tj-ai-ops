@@ -8,11 +8,12 @@ import type {
   PoExportRecord,
   PoHeader,
   PoLine,
+  PoLineInput,
   PoWithLines,
   Supplier,
 } from '@/types/tjPo'
 import { ADD_ITEM_WRITES_ENABLED } from './featureFlags'
-import { combineApprove, combineCancel, combineCreate, combineSubmit, poSave } from './tjGrApi'
+import { combineApprove, combineCancel, combineCreate, combineSubmit, poGet, poSave } from './tjGrApi'
 import { IS_PREVIEW_SCHEMA, supabase as db } from './supabaseClient'
 import {
   approveCombinedPoFlow,
@@ -86,7 +87,30 @@ export async function listPos(): Promise<PoHeader[]> {
   })
 }
 
+/**
+ * 读 PO：Preview 走 po_get（RPC，返回 decimal string 明细；旧表对 anon 直读已撤销），
+ * 生产保持旧的两次表读取。返回结构必须完整（id/lines），否则拒绝当作成功。
+ */
 export async function getPo(id: string): Promise<PoWithLines> {
+  if (IS_PREVIEW_SCHEMA) {
+    const res = (await poGet(id)) as Record<string, any> | null
+    const header = res?.po ?? res?.po_header ?? res?.header ?? res?.data ?? res
+    if (!header || typeof header.id !== 'string' || !header.id) {
+      throw new Error('po_get 未返回 PO id：拒绝当作读取成功')
+    }
+    if (header.id !== id) {
+      throw new Error(`po_get 返回了不同的 PO id（${header.id} ≠ ${id}）：拒绝覆盖原单`)
+    }
+    const lines = Array.isArray(res?.lines)
+      ? res.lines
+      : Array.isArray(header?.lines)
+        ? header.lines
+        : null
+    if (!lines) throw new Error('po_get 未返回 lines 数组：拒绝以不完整数据继续')
+    const { lines: _ignored, ...rest } = header as Record<string, any>
+    return { ...(rest as PoHeader), lines: lines as PoLine[] }
+  }
+
   const { data: header, error: he } = await db
     .from('tj_po_headers')
     .select('*')
@@ -114,6 +138,15 @@ export async function getPosByIds(ids: string[]): Promise<PoWithLines[]> {
   return result
 }
 
+/** 旧生产路径（Excel/旧表）需要 number：只在这里显式转换，不做隐式 Number 往返 */
+function legacyNumber(raw: string | number, field: string): number {
+  const n = typeof raw === 'number' ? raw : Number(String(raw))
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`旧生产路径需要数值型${field}：${String(raw)}`)
+  }
+  return n
+}
+
 /** po_save 返回值归一（不同后端可能在 po/event/header 里包一层）；id 必须存在且与预期一致 */
 function poHeaderFromRpc(res: unknown, expectedId: string | null): PoHeader {
   const r = res as Record<string, any> | null
@@ -128,7 +161,7 @@ function poHeaderFromRpc(res: unknown, expectedId: string | null): PoHeader {
   return header as PoHeader
 }
 
-function poSaveLines(lines: PoLine[]) {
+function poSaveLines(lines: PoLineInput[]) {
   return lines.map((l, i) => ({
     // 已存在的行带上原 id：事务内原地更新，行 id 稳定（不删行重插）
     id: l.id ?? null,
@@ -136,15 +169,16 @@ function poSaveLines(lines: PoLine[]) {
     item_code: l.item_code,
     description: l.description,
     uom: l.uom ?? null,
-    qty: String(l.qty),
-    unit_price: String(l.unit_price),
+    // Preview：原样 decimal string，不 Number 化（精度不能在保存前丢失）
+    qty: l.qty,
+    unit_price: l.unit_price,
   }))
 }
 
 /** 新建 PO：Preview 走 po_save RPC（事务 + 稳定行 id + 幂等 request_id）；生产保持原两次写入 */
 export async function createPo(
   supplier: Supplier,
-  lines: PoLine[],
+  lines: PoLineInput[],
   createdBy: string,
   notes: string | null = null,
   requestId: string = crypto.randomUUID()
@@ -182,8 +216,9 @@ export async function createPo(
     item_code: l.item_code,
     description: l.description,
     uom: l.uom,
-    qty: l.qty,
-    unit_price: l.unit_price,
+    // 旧生产路径（原 Excel/旧表语义）显式转 number
+    qty: legacyNumber(l.qty, '数量'),
+    unit_price: legacyNumber(l.unit_price, '单价'),
   }))
   const { error: le } = await db.from('tj_po_lines').insert(rows)
   if (le) throw le
@@ -195,7 +230,7 @@ export async function createPo(
 export async function updatePo(
   id: string,
   supplier: Supplier,
-  lines: PoLine[],
+  lines: PoLineInput[],
   notes: string | null = null,
   requestId: string = crypto.randomUUID(),
   createdBy: string | null = null
@@ -233,8 +268,8 @@ export async function updatePo(
     item_code: l.item_code,
     description: l.description,
     uom: l.uom,
-    qty: l.qty,
-    unit_price: l.unit_price,
+    qty: legacyNumber(l.qty, '数量'),
+    unit_price: legacyNumber(l.unit_price, '单价'),
   }))
   const { error: le } = await db.from('tj_po_lines').insert(rows)
   if (le) throw le
@@ -260,6 +295,10 @@ export async function reorderLines(poHeaderId: string, orderedLineIds: string[])
 }
 
 export async function deletePo(id: string): Promise<void> {
+  if (IS_PREVIEW_SCHEMA) {
+    // Preview：旧表直写（delete）已撤销，避免出现「界面删了、库里还在」的假成功
+    throw new Error('预览环境不支持直接删除 PO（旧表直写已撤销）：请使用取消/状态流程')
+  }
   const { error } = await db.from('tj_po_headers').delete().eq('id', id).limit(1)
   if (error) throw error
 }

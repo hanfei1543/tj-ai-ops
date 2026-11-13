@@ -7,14 +7,20 @@
 //   * 一行可以有多个来源分配（合并单来源 PO/行），分配合计必须等于该行实收。
 //   * 超收 / 额外行属于例外：可以提交，但必须走审批复核（requires_exception_approval）。
 //   * 零行允许保存草稿，但不形成正式 GR，不能提交。
+//   * Invoice No. 与 Delivery Order No. 至少一项（可只开发票或只开送货单）；
+//     两者都空只能存草稿。编号文本原样保存，trim 只用于判空，不改写号码。
 //   * 草稿身份按「已选 PO 集合」持久在 sessionStorage/localStorage：同一批未提交草稿复用
 //     同一 UUID；一旦提交/放行，绑定立即销毁，同一 PO 的下一批收货必须换新 UUID。
-//   * 状态/任务文案只说真实状态：waiting_mapping / blocked / needs_review 明确展示，
+//   * 状态/任务文案只说服务端真实返回的状态：waiting_mapping / needs_review /
+//     review_required 明确展示，不虚构 blocked 等不存在的状态；
 //     任务永远不等于 IRS 成功/已过账。
 
 export const DRAFT_STORAGE_PREFIX = 'tj_gr_draft:'
 
 export const RECEIPT_ROLES = Object.freeze(['staff', 'approver', 'executor', 'admin'])
+
+/** 可登记收货的 PO 状态：普通已确认、合并单已批准、合并后的原标准单、生产已导出普通单 */
+export const RECEIVABLE_PO_STATUSES = Object.freeze(['confirmed', 'combined', 'exported'])
 
 const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/
 const DECIMAL = /^\+?\d+(\.\d+)?$/
@@ -26,6 +32,31 @@ function isBlank(v) {
 
 function isUuid(v) {
   return typeof v === 'string' && UUID_RE.test(v.trim())
+}
+
+/** 收货入口是否接受该 PO 状态（服务端仍会再校验） */
+export function isReceivablePoStatus(status) {
+  return RECEIVABLE_PO_STATUSES.includes(String(status ?? '').trim())
+}
+
+/**
+ * 合并来源资格：标准单、confirmed、未冻结（frozen=false）。
+ * 合并单自身、已冻结、合并中/已合并、已导出/推送中的单都不能再当来源。
+ */
+export function isCombinableSource(po) {
+  return (
+    !!po &&
+    String(po.po_type ?? 'standard') !== 'combined' &&
+    String(po.status ?? '') === 'confirmed' &&
+    po.frozen !== true
+  )
+}
+
+/** Invoice/DO 是否至少有一个非空（trim 只用于判空，不改写原字符串） */
+export function documentNumbersPresent(header) {
+  const invoice = String(header?.invoice_no ?? '').trim()
+  const deliveryOrder = String(header?.delivery_order_no ?? '').trim()
+  return invoice !== '' || deliveryOrder !== ''
 }
 
 /** 只接受真实存在的 yyyy-MM-dd（不接受 ISO 时间戳/本地化格式） */
@@ -154,7 +185,6 @@ export function receiptStatusBadge(status) {
     verified: ['证据核对通过（未推送 IRS）', 'bg-emerald-100 text-emerald-700'],
     needs_review: ['需复核（needs_review）', 'bg-red-100 text-red-700'],
     failed_unsaved: ['保存失败（未写入）', 'bg-red-100 text-red-700'],
-    blocked: ['已阻断（blocked）', 'bg-red-100 text-red-700'],
     rejected: ['已拒绝', 'bg-slate-200 text-slate-600'],
     cancelled: ['已取消', 'bg-slate-200 text-slate-600'],
   }
@@ -195,6 +225,62 @@ export function taskStatusBadge(status) {
     // 前端永远不认定 IRS 已成功/已过账
     irs_confirmed: false,
   }
+}
+
+/**
+ * 事件是否已经进入「不可重做」区：已放行（released_at 或已建任务）或 verified 终态。
+ * 这类事件不能再 approve / submit / release / edit —— 重做会造成重复过账。
+ * @returns {null | {code: string, terminal: boolean, message: string}}
+ */
+export function receiptRedoLock(event) {
+  if (!event) return null
+  const status = String(event.status ?? '').trim()
+  if (status === 'verified') {
+    return {
+      code: 'VERIFIED_TERMINAL',
+      terminal: true,
+      message: '证据核对已通过（verified，终态）：不能再次提交/批准/放行/编辑，需人工核对本机记录。',
+    }
+  }
+  const releasedAt = String(event.released_at ?? '').trim()
+  const tasks = Array.isArray(event.tasks) ? event.tasks : []
+  if (releasedAt !== '' || tasks.length > 0) {
+    return {
+      code: 'RELEASED_LOCKED',
+      terminal: false,
+      message:
+        '该事件已放行并生成本机任务：不能重新提交/批准/放行或改行（避免重复过账），' +
+        '请按本机回报人工核对。',
+    }
+  }
+  return null
+}
+
+/**
+ * IRS PO 映射证据：必须由审批人给出可核查的证据与核验方式，并显式确认已核对。
+ * 不允许只写「页面登记」+ 当前时间就当作核验证据。
+ * @returns {{checked_by: string, checked_at: string, evidence_ref: string, method: string, confirmed: true}}
+ */
+export function buildMappingEvidence({
+  checkedBy,
+  evidenceRef,
+  method,
+  confirmed,
+  now = () => new Date(),
+} = {}) {
+  const by = String(checkedBy ?? '').trim()
+  const ref = String(evidenceRef ?? '').trim()
+  const how = String(method ?? '').trim()
+  if (!by) throw new Error('核验人缺失：映射证据必须记录登录身份')
+  if (!ref) {
+    throw new Error('请填写可核查证据（IRS 采购单页面/截图文件名/纸单据编号），不能只写「页面登记」')
+  }
+  if (!how) throw new Error('请填写核验方式（例如 IRS 系统查询、纸质单据核对）')
+  if (confirmed !== true) throw new Error('请先勾选「已核对 IRS 采购单编号」再登记映射')
+  const at = now()
+  const iso = at instanceof Date ? at.toISOString() : String(at)
+  if (Number.isNaN(new Date(iso).getTime())) throw new Error('核验时间不可解析，拒绝登记映射证据')
+  return { checked_by: by, checked_at: iso, evidence_ref: ref, method: how, confirmed: true }
 }
 
 function pushError(errors, path_, message) {
@@ -267,7 +353,9 @@ export function validateReceiptForm({ header, lines, identity = null } = {}) {
       exceptions.push({
         code: 'EXTRA_LINE',
         line_no: l?.line_no ?? i + 1,
-        message: `${label} 没有来源分配（额外/替代行）：需审批复核`,
+        message:
+          `${label} 没有可核实的原 PO 来源分配（额外/替代行）：可保存/提交，` +
+          '但放行会被服务端阻止（GR_EXTRA_ASSIGNMENT_REQUIRED），需人工指定来源',
       })
     } else {
       const allocValues = []
@@ -299,11 +387,16 @@ export function validateReceiptForm({ header, lines, identity = null } = {}) {
   })
 
   const ok = errors.length === 0
-  const canSubmit = ok && list.length > 0
+  const hasDocumentNumber = documentNumbersPresent(h)
+  const canSubmit = ok && list.length > 0 && hasDocumentNumber
   const requiresExceptionApproval = canSubmit && exceptions.length > 0
   let submitBlockedReason = ''
   if (!ok) submitBlockedReason = '请先修正表单错误'
   else if (list.length === 0) submitBlockedReason = '没有收货行：只能保存草稿，不会形成正式 GR'
+  else if (!hasDocumentNumber) {
+    submitBlockedReason =
+      'Invoice No. 与 Delivery Order No. 至少填写一项才能提交/放行（两者都空只能保存草稿）'
+  }
 
   return {
     ok,
@@ -313,6 +406,7 @@ export function validateReceiptForm({ header, lines, identity = null } = {}) {
     canSubmit,
     requires_exception_approval: requiresExceptionApproval,
     submit_blocked_reason: submitBlockedReason,
+    has_document_number: hasDocumentNumber,
   }
 }
 
@@ -379,8 +473,9 @@ export function buildReceiptSavePayload({ receiptId, revision, selectedPoIds, he
     id,
     revision: Number.isInteger(revision) ? revision : 0,
     po_ids: poIds,
-    invoice_no: String(h.invoice_no ?? '').trim(),
-    delivery_order_no: String(h.delivery_order_no ?? '').trim(),
+    // 单号是业务文本：原样保存（前导零/大小写/空格都不改写），trim 只在判空时用
+    invoice_no: String(h.invoice_no ?? ''),
+    delivery_order_no: String(h.delivery_order_no ?? ''),
     receive_date: String(h.receive_date ?? '').trim(),
     invoice_date: isBlank(h.invoice_date) ? null : String(h.invoice_date).trim(),
     checked_by: String(h.checked_by ?? '').trim(),
@@ -498,6 +593,16 @@ export function createReceiptDraftSession({
       if (Number.isInteger(event.revision)) revision = event.revision
       else if (Number.isFinite(Number(event.revision))) revision = Number(event.revision)
       else revision += 1
+      persist('draft')
+    },
+    /**
+     * 保存遇到「会话已有草稿/版本冲突」时，用服务端返回的草稿 id/revision
+     * 恢复当前会话，再重试保存（不新建第二张草稿）。
+     */
+    adoptDraft({ receipt_id, revision: serverRevision } = {}) {
+      if (typeof receipt_id === 'string' && receipt_id) receiptId = receipt_id
+      if (Number.isInteger(serverRevision)) revision = serverRevision
+      else if (Number.isFinite(Number(serverRevision))) revision = Number(serverRevision)
       persist('draft')
     },
     /**

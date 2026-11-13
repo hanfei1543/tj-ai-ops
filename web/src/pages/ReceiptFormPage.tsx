@@ -2,15 +2,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { AlertTriangle, ArrowLeft, CheckCircle2, Loader2, Save, Send } from 'lucide-react'
 import { getPo } from '@/lib/tjPoApi'
-import { approveReceipt, getReceipt, releaseReceipt, saveReceipt, submitReceipt } from '@/lib/tjGrApi'
+import { approveReceipt, getReceipt, listReceipts, releaseReceipt, saveReceipt, submitReceipt } from '@/lib/tjGrApi'
+import { GrApiError } from '@/lib/grRpc'
 import {
   addDecimalStrings,
   buildReceiptSavePayload,
   compareDecimalStrings,
   createReceiptDraftSession,
+  documentNumbersPresent,
+  isReceivablePoStatus,
+  receiptRedoLock,
   receiptStatusBadge,
   validateReceiptForm,
 } from '@/lib/core/gr-form.js'
+import { buildReceiptAllocations, sumAllocationQty } from '@/lib/core/po-input.js'
 import type { GrCapabilities, GrFormHeader, GrFormLine, ReceiptDraftSession } from '@/lib/core/gr-form.js'
 import type { GrIdentity } from '@/lib/grAuth'
 import type { PoWithLines } from '@/types/tjPo'
@@ -31,33 +36,20 @@ function emptyHeader(checkedBy: string): GrFormHeader {
   }
 }
 
-function fallbackAllocation(poId: string, lineId: string, qty: string) {
-  return { po_header_id: poId, po_line_id: lineId, accepted_qty: qty }
-}
-
-function allocationsForLine(po: PoWithLines, lineId: string, ordered: string) {
-  const refs = Array.isArray(po.lines.find((l) => l.id === lineId)?.source_refs)
-    ? (po.lines.find((l) => l.id === lineId)?.source_refs ?? [])
-    : []
-  if (po.po_type === 'combined' && refs.length > 0) {
-    const allocs = refs
-      .filter((r) => r.po_id && r.line_id)
-      .map((r) => ({
-        po_header_id: r.po_id,
-        po_line_id: r.line_id,
-        accepted_qty: String(r.qty ?? ''),
-      }))
-    if (allocs.length > 0) return allocs
-  }
-  // 普通单：整行来源就是这张 PO 的对应行
-  if (lineId) return [fallbackAllocation(po.id, lineId, ordered)]
-  return []
-}
-
-function linesFromPo(po: PoWithLines): GrFormLine[] {
+/**
+ * 从 PO 行生成收货行。
+ * defaultAccepted=false（该 PO 已有历史收货 = 非首批）时不预填满额：
+ * 实收必须由人按本批实际情况填写，避免「第二次默认全收」。
+ */
+function linesFromPo(po: PoWithLines, { defaultAccepted }: { defaultAccepted: boolean }): GrFormLine[] {
   return po.lines.map((l, i) => {
     const ordered = String(l.original_qty ?? l.qty ?? '')
-    const allocations = allocationsForLine(po, l.id ?? '', ordered)
+    const allocations = buildReceiptAllocations(po, l, { defaultAccepted })
+    const accepted = defaultAccepted
+      ? allocations.length > 0
+        ? sumAllocationQty(allocations)
+        : ordered
+      : ''
     return {
       id: newUuid(),
       line_no: l.line_no ?? i + 1,
@@ -66,7 +58,7 @@ function linesFromPo(po: PoWithLines): GrFormLine[] {
       uom: l.uom ?? null,
       unit_price: String(l.unit_price ?? ''),
       ordered_qty: ordered,
-      accepted_qty: ordered,
+      accepted_qty: accepted,
       note: l.note ?? '',
       source_allocations: allocations,
     }
@@ -79,6 +71,30 @@ function draftStorage(): Storage {
   } catch {
     throw new Error('浏览器禁用了 sessionStorage：无法安全保存草稿身份，已停止（避免重复建单）')
   }
+}
+
+/**
+ * 保存遇到「会话已有草稿/版本冲突」时，读取服务端真实草稿并恢复会话身份；
+ * 恢复不了就保持原错误（不本地猜测 id/revision）。
+ */
+async function recoverDraft(
+  session: ReceiptDraftSession,
+  err: unknown,
+): Promise<GrReceiptEvent | null> {
+  if (!(err instanceof GrApiError)) return null
+  const detail = (err.detail ?? null) as Record<string, unknown> | null
+  const candidate = [detail?.receipt_id, detail?.draft_id, detail?.id].find(
+    (v): v is string => typeof v === 'string' && v !== '',
+  )
+  if (candidate) {
+    const ev = await getReceipt(candidate).catch(() => null)
+    if (ev && (ev.status === 'draft' || ev.status === 'needs_review')) return ev
+  }
+  if (err.code === 'GR_REVISION_CONFLICT' || err.code === 'GR_IDEMPOTENCY_CONFLICT') {
+    const ev = await getReceipt(session.receiptId).catch(() => null)
+    if (ev && ev.status === 'draft') return ev
+  }
+  return null
 }
 
 export default function ReceiptFormPage({ identity, caps }: { identity: GrIdentity; caps: GrCapabilities }) {
@@ -102,6 +118,8 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
   const [revision, setRevision] = useState(0)
   const [allowExceptions, setAllowExceptions] = useState(false)
   const [reviewNote, setReviewNote] = useState('')
+  // 非首批（该 PO 已有历史收货）：不预填满额，提示按本次实收确认
+  const [secondBatchPoIds, setSecondBatchPoIds] = useState<string[]>([])
 
   const sessionRef = useRef<ReceiptDraftSession | null>(null)
   const [sessionReady, setSessionReady] = useState(false)
@@ -154,15 +172,50 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
           if (requestedPoIds.length === 0) throw new Error('未选择要收货的采购单')
           const headers: PoWithLines[] = []
           for (const id of requestedPoIds) headers.push(await getPo(id))
-          const bad = headers.filter((p) => p.status !== 'confirmed')
+          const bad = headers.filter((p) => !isReceivablePoStatus(p.status))
           if (bad.length > 0) {
             throw new Error(
-              `采购单 ${bad.map((p) => p.po_id).join('、')} 状态不是 confirmed，不能登记收货`,
+              `采购单 ${bad.map((p) => `${p.po_id}（${p.status}）`).join('、')} 当前状态不能登记收货`,
             )
           }
+
+          // 已有历史收货判定：按 PO 自身 + 合并单来源原始 PO 查询服务端事件（不猜本地缓存）。
+          // 查询失败按「已有收货」处理：宁可不预填，也不默认全收。
+          const queryIds = new Set<string>()
+          for (const po of headers) {
+            queryIds.add(po.id)
+            for (const l of po.lines ?? []) {
+              for (const r of l.source_refs ?? []) if (r.po_id) queryIds.add(r.po_id)
+            }
+          }
+          const priorIds = new Set<string>()
+          await Promise.all(
+            Array.from(queryIds).map(async (id) => {
+              try {
+                const evs = await listReceipts({ po_id: id })
+                if (evs.length > 0) priorIds.add(id)
+              } catch {
+                priorIds.add(id)
+              }
+            }),
+          )
+          const secondBatch = headers
+            .filter((po) => {
+              if (priorIds.has(po.id)) return true
+              return (po.lines ?? []).some((l) =>
+                (l.source_refs ?? []).some((r) => !!r.po_id && priorIds.has(r.po_id)),
+              )
+            })
+            .map((po) => po.id)
+
           if (!mounted) return
+          setSecondBatchPoIds(secondBatch)
           setTargets(headers)
-          setLines(headers.flatMap((p) => linesFromPo(p)))
+          setLines(
+            headers.flatMap((p) =>
+              linesFromPo(p, { defaultAccepted: !secondBatch.includes(p.id) }),
+            ),
+          )
         }
       } catch (e) {
         if (mounted) setError(e instanceof Error ? e.message : '加载失败')
@@ -203,7 +256,11 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
   }, [loading, error, receiptIdParam, targetPoIds.join(','), event?.id])
 
   const validation = validateReceiptForm({ header, lines, identity })
-  const editable = !event || event.status === 'draft' || event.status === 'needs_review'
+  // 已放行/已建任务/verified：不可重做（服务端同样会拒绝）
+  const redoLock = receiptRedoLock(event)
+  const editable =
+    !event || ((event.status === 'draft' || event.status === 'needs_review') && !redoLock)
+  const extraLines = lines.filter((l) => l.source_allocations.length === 0)
 
   function updateHeader(patch: Partial<GrFormHeader>) {
     setHeader((h) => ({ ...h, ...patch }))
@@ -252,10 +309,31 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
     })
   }
 
+  /** 保存草稿；遇到会话已有草稿/版本冲突时从服务端恢复 id/revision 后重试一次 */
+  const persistDraft = useCallback(
+    async (session: ReceiptDraftSession): Promise<{ ev: GrReceiptEvent; restored: boolean }> => {
+      try {
+        return { ev: await saveReceipt(currentPayload()), restored: false }
+      } catch (e) {
+        const draft = await recoverDraft(session, e)
+        if (!draft) throw e
+        session.adoptDraft({ receipt_id: draft.id, revision: draft.revision })
+        setRevision(session.revision)
+        return { ev: await saveReceipt(currentPayload()), restored: true }
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [header, lines, targetPoIds],
+  )
+
   const saveDraft = useCallback(async (): Promise<GrReceiptEvent | null> => {
     const session = sessionRef.current
     if (!session) {
       setError('草稿会话尚未就绪')
+      return null
+    }
+    if (redoLock) {
+      setError(redoLock.message)
       return null
     }
     const v = validateReceiptForm({ header, lines, identity })
@@ -268,14 +346,15 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
     setError('')
     setNotice('')
     try {
-      const ev = await saveReceipt(currentPayload())
+      const { ev, restored } = await persistDraft(session)
       session.saveResult(ev)
       setRevision(session.revision)
       setEvent(ev)
+      const prefix = restored ? '已恢复服务端草稿并保存。' : ''
       setNotice(
-        ev.needs_review
-          ? `草稿已保存（版本 ${session.revision}），但服务端标记需复核（needs_review）：本次保存未被读回确认，请审批人复核。`
-          : `草稿已保存（版本 ${session.revision}）。余量以服务端为准，刷新后可从数据库恢复。`,
+        ev.review_required
+          ? `${prefix}草稿已保存（版本 ${session.revision}），但服务端标记需复核（review_required）：请审批人核对后再提交/放行。`
+          : `${prefix}草稿已保存（版本 ${session.revision}）。余量以服务端为准，刷新后可从数据库恢复。`,
       )
       return ev
     } catch (e) {
@@ -285,11 +364,15 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
       session.end()
       setBusy('')
     }
-  }, [header, lines, identity, targetPoIds]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [header, lines, identity, redoLock, persistDraft]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleSubmit(release: boolean) {
     const session = sessionRef.current
     if (!session) return
+    if (redoLock) {
+      setError(redoLock.message)
+      return
+    }
     const v = validateReceiptForm({ header, lines, identity })
     if (!v.canSubmit) {
       setError(v.submit_blocked_reason || v.errors.map((e) => e.message).join('；'))
@@ -297,6 +380,12 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
     }
     if (release && !caps.canApprove) {
       setError('当前身份没有审批角色：不能放行')
+      return
+    }
+    if (release && !documentNumbersPresent(header)) {
+      setError(
+        '放行前必须至少填写 Invoice No. 或 Delivery Order No.（IRS 发票号以 Invoice No. 为准，号码原样保存；两者都空只能存草稿）',
+      )
       return
     }
     if (v.requires_exception_approval && release && !allowExceptions) {
@@ -312,29 +401,29 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
     setError('')
     setNotice('')
     try {
-      const saved = await saveReceipt(currentPayload())
+      const { ev: saved } = await persistDraft(session)
       session.saveResult(saved)
       setEvent(saved)
 
-      let submitted = await submitReceipt({ id: session.receiptId, revision: session.revision })
+      const submitted = await submitReceipt({ id: session.receiptId, revision: session.revision })
       session.submitResult(submitted)
       setRevision(submitted.revision)
       setEvent(submitted)
 
-      if (submitted.status === 'blocked' || submitted.status === 'waiting_mapping') {
+      if (submitted.status === 'waiting_mapping') {
         const badge = receiptStatusBadge(submitted.status)
-        throw new Error(`服务端状态 ${badge.label}，不能自动放行：${submitted.status_reason ?? '请按服务端状态处理后重试'}`)
+        throw new Error(`服务端状态 ${badge.label}，不能自动放行：请先登记映射后重试`)
       }
 
       if (release) {
-        if (submitted.needs_review && !allowExceptions) {
-          throw new Error('服务端标记需复核（needs_review）：请勾选「确认例外」并填写复核说明后再放行')
+        if (submitted.review_required && !allowExceptions) {
+          throw new Error('服务端标记需复核（review_required）：请勾选「确认例外」并填写复核说明后再放行')
         }
-        if (submitted.needs_review && !reviewNote.trim()) {
+        if (submitted.review_required && !reviewNote.trim()) {
           throw new Error('存在异常：放行必须填写复核说明（review_note）')
         }
-        if (!header.delivery_order_no.trim()) {
-          throw new Error('放行前必须填写 Delivery Order No.（合同要求，不能空）')
+        if (!documentNumbersPresent(header)) {
+          throw new Error('放行前必须至少填写 Invoice No. 或 Delivery Order No.（合同要求，不能都空）')
         }
         const approved = await approveReceipt({
           id: submitted.id,
@@ -386,6 +475,8 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
     )
   }
 
+  const anySecondBatch = targets.some((p) => secondBatchPoIds.includes(p.id))
+
   return (
     <div>
       <header className="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -400,7 +491,7 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
           <h1 className="text-2xl font-bold text-slate-900">登记本次收货</h1>
           <p className="text-sm text-slate-500">
             {targets.length > 0 ? targets.map((p) => p.po_id).join(' + ') : '收货事件'}
-            {targets[0]?.po_type === 'combined' ? '（合并单，来源行按原 UUID 保留）' : ''}
+            {targets[0]?.po_type === 'combined' ? '（合并单，来源行按原始 PO 行 UUID 分配）' : ''}
           </p>
         </div>
         <div className="text-right text-xs text-slate-500">
@@ -422,7 +513,13 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
           <span>{notice}</span>
         </div>
       )}
-      {!editable && (
+      {redoLock && (
+        <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <div className="font-semibold">人工核对，不可重做</div>
+          <p className="mt-1 text-xs">{redoLock.message}</p>
+        </div>
+      )}
+      {!editable && !redoLock && (
         <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
           该收货事件状态为 {receiptStatusBadge(event?.status).label}，已不能在此编辑。
           <Link to={`/tj-po-system/receipts/${event?.id}`} className="ml-2 font-semibold underline">
@@ -445,18 +542,28 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
                 {p.po_type === 'combined' && (
                   <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs text-violet-700">合并单</span>
                 )}
+                {secondBatchPoIds.includes(p.id) && (
+                  <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-700">
+                    已有收货记录 · 本批不预填
+                  </span>
+                )}
               </li>
             )
           })}
           {targets.length === 0 && <li className="text-slate-400">（事件来源未返回）</li>}
         </ul>
+        {anySecondBatch && (
+          <p className="mt-2 text-xs text-amber-700">
+            该采购单已有历史收货：实收数量默认留空，请按本次实际到货逐行填写（累计余量由服务端批准时按来源行校验）。
+          </p>
+        )}
       </section>
 
       {/* 收货资料：员工只填这些 */}
       <section className="mb-4 rounded-2xl border border-slate-200 bg-white p-4">
         <div className="grid gap-3 md:grid-cols-3">
           <label className="block text-xs font-medium text-slate-600">
-            Invoice No.
+            Invoice No.（IRS 发票号，原样保存）
             <input
               value={header.invoice_no}
               onChange={(e) => updateHeader({ invoice_no: e.target.value })}
@@ -512,6 +619,10 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
             />
           </label>
         </div>
+        <p className="mt-2 text-[11px] text-slate-400">
+          Invoice No. 与 Delivery Order No. 至少填写一项才能提交/放行；两者都空只能保存草稿。
+          号码按原样保存（trim 只用于判空，不改写发票/送货单号）。
+        </p>
       </section>
 
       {/* 明细 */}
@@ -545,6 +656,7 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
                       onChange={(e) => updateAccepted(l, e.target.value)}
                       disabled={!editable || l.source_allocations.length > 1}
                       inputMode="decimal"
+                      placeholder={editable ? '本批实收' : ''}
                       title={l.source_allocations.length > 1 ? '多来源行：实收 = 下方来源分配合计' : ''}
                       className={`w-full rounded-lg border px-2 py-1.5 text-right text-sm outline-none ${
                         over ? 'border-amber-300 bg-amber-50' : 'border-slate-300 focus:border-emerald-500'
@@ -576,11 +688,18 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
                             onChange={(e) => updateAllocation(l, ai, e.target.value)}
                             disabled={!editable}
                             inputMode="decimal"
+                            placeholder="本批"
                             className="w-20 rounded border border-slate-300 px-2 py-1 text-right"
                           />
                         </div>
                       ))}
                     </div>
+                  </div>
+                )}
+                {l.source_allocations.length === 0 && (
+                  <div className="mt-2 rounded-lg bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
+                    无可核实的原 PO 来源分配：可先保存/提交，但放行会被服务端阻止
+                    （GR_EXTRA_ASSIGNMENT_REQUIRED），需人工指定来源。
                   </div>
                 )}
               </div>
@@ -605,7 +724,14 @@ export default function ReceiptFormPage({ identity, caps }: { identity: GrIdenti
         </div>
       )}
 
-      {caps.canApprove && (
+      {extraLines.length > 0 && (
+        <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+          有 {extraLines.length} 行没有可核实的原 PO 来源：审批可保留这些行，但服务端放行时会以
+          GR_EXTRA_ASSIGNMENT_REQUIRED 阻止（需人工指定来源/确认无法自动过账），界面不会把漏行当作成功。
+        </div>
+      )}
+
+      {caps.canApprove && editable && (
         <section className="mb-4 rounded-2xl border border-slate-200 bg-white p-4">
           <label className="flex items-center gap-2 text-sm text-slate-700">
             <input

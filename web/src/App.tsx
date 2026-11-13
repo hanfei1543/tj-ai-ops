@@ -1,6 +1,6 @@
 import { lazy, Suspense } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
-import GrAuthGate from './components/GrAuthGate'
+import GrAuthGate, { PreviewAuthGate } from './components/GrAuthGate'
 
 const TjPoSystemPage = lazy(() => import('./pages/TjPoSystemPage'))
 const CombinePoPage = lazy(() => import('./pages/CombinePoPage'))
@@ -20,10 +20,26 @@ export default function App() {
     >
       <Routes>
         <Route path="/" element={<Navigate to="/tj-po-system" replace />} />
-        <Route path="/tj-po-system" element={<TjPoSystemPage />} />
-        <Route path="/tj-po-system/new" element={<TjPoSystemPage />} />
-        <Route path="/tj-po-system/combine" element={<CombinePoPage />} />
-        <Route path="/tj-po-system/items" element={<AddItemPage />} />
+        {/*
+          普通采购页面（列表/新建/编辑/合并/商品申请）：
+          Preview 需要登录身份（旧表 anon 读写撤销），生产 public 直接放行 —— 不套收货 gate。
+        */}
+        <Route
+          path="/tj-po-system"
+          element={<PreviewAuthGate><TjPoSystemPage /></PreviewAuthGate>}
+        />
+        <Route
+          path="/tj-po-system/new"
+          element={<PreviewAuthGate><TjPoSystemPage /></PreviewAuthGate>}
+        />
+        <Route
+          path="/tj-po-system/combine"
+          element={<PreviewAuthGate><CombinePoPage /></PreviewAuthGate>}
+        />
+        <Route
+          path="/tj-po-system/items"
+          element={<PreviewAuthGate><AddItemPage /></PreviewAuthGate>}
+        />
         {/* 统一收货：预览环境专用（GrAuthGate 内硬禁用生产 + 登录 + 角色） */}
         <Route
           path="/tj-po-system/receipts"
@@ -41,7 +57,10 @@ export default function App() {
           path="/tj-po-system/receipts/:receiptId"
           element={<GrAuthGate>{(identity, caps) => <ReceiptDetailPage identity={identity} caps={caps} />}</GrAuthGate>}
         />
-        <Route path="/tj-po-system/:poId" element={<TjPoSystemPage />} />
+        <Route
+          path="/tj-po-system/:poId"
+          element={<PreviewAuthGate><TjPoSystemPage /></PreviewAuthGate>}
+        />
       </Routes>
     </Suspense>
   )

@@ -28,7 +28,9 @@ import {
   searchSuppliers,
   updatePo,
 } from '@/lib/tjPoApi'
-import type { Item, PoHeader, PoLine, Supplier } from '@/types/tjPo'
+import type { Item, PoHeader, PoLineInput, Supplier } from '@/types/tjPo'
+import { isCombinableSource, isReceivablePoStatus } from '@/lib/core/gr-form.js'
+import { toPoLineInputs } from '@/lib/core/po-input.js'
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -353,8 +355,14 @@ function PoList({
     }
   }
 
-  // 合并勾选：只允许 confirmed；强制相同 Supplier Code
+  // 合并勾选：只允许 standard + confirmed + frozen=false（后端同样拒绝）；强制相同 Supplier Code
   function toggleSelect(p: PoHeader) {
+    if (!isCombinableSource(p)) {
+      setError(
+        `采购单 ${p.po_id} 不能作为合并来源：必须是未冻结的 standard confirmed 单（当前 ${p.po_type}/${p.status}${p.frozen ? '/已冻结' : ''}）`,
+      )
+      return
+    }
     if (selected.has(p.id)) {
       const next = new Set(selected)
       next.delete(p.id)
@@ -464,7 +472,9 @@ function PoList({
           <ul className="space-y-2">
             {pos.map((p) => {
               const s = poStatusBadge(p.status, p.po_type)
-              const notCombinable = combineMode && p.status !== 'confirmed'
+              const combinable = isCombinableSource(p)
+              const notCombinable = combineMode && !combinable
+              const receivable = isReceivablePoStatus(p.status)
               return (
                 <li
                   key={p.id}
@@ -477,7 +487,7 @@ function PoList({
                       type="checkbox"
                       checked={selected.has(p.id)}
                       onChange={() => toggleSelect(p)}
-                      disabled={p.status !== 'confirmed'}
+                      disabled={!combinable}
                       className="h-4 w-4 shrink-0 accent-emerald-600 disabled:opacity-30"
                     />
                   )}
@@ -516,7 +526,7 @@ function PoList({
                       已冻结·不可推送
                     </span>
                   )}
-                  {!combineMode && p.status === 'confirmed' && (
+                  {!combineMode && receivable && (
                     <button
                       type="button"
                       onClick={() => navigate(`/tj-po-system/receipts/new?po_ids=${p.id}`)}
@@ -653,7 +663,8 @@ function PoEditor({
     const [moved] = next.splice(from, 1)
     next.splice(to, 0, moved)
     setLines(next)
-    if (savedPoId && next.every((l) => l.lineId)) {
+    // Preview：旧表直写（update line_no）已撤销；顺序在保存时随 po_save 一起落库
+    if (savedPoId && next.every((l) => l.lineId) && !IS_PREVIEW_SCHEMA) {
       reorderLines(savedPoId, next.map((l) => l.lineId!)).catch((e) =>
         setError(e.message || '排序保存失败')
       )
@@ -692,7 +703,7 @@ function PoEditor({
     focusQty(key)
   }
 
-  function buildLines(): PoLine[] | null {
+  function buildLines(): PoLineInput[] | null {
     if (!supplier) {
       setError('请先选择供应商')
       return null
@@ -702,28 +713,22 @@ function PoEditor({
       setError('请至少加入一个商品')
       return null
     }
-    for (const l of valid) {
-      const qty = parseFloat(l.qty)
-      if (!l.qty || Number.isNaN(qty) || qty <= 0) {
-        setError('每个商品的数量必须大于 0')
-        return null
-      }
-      const price = parseFloat(l.unitPrice)
-      if (l.unitPrice === '' || Number.isNaN(price) || price < 0) {
-        setError('每个商品的单价必须 ≥ 0')
-        return null
-      }
+    try {
+      // Preview：decimal string 原样进 po_save（不 parseFloat，避免保存前丢精度）
+      return toPoLineInputs(
+        valid.map((l) => ({
+          id: l.lineId,
+          item_code: l.item!.code,
+          description: l.item!.description,
+          uom: l.item!.uom,
+          qty: l.qty,
+          unit_price: l.unitPrice,
+        })),
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '商品明细不合法')
+      return null
     }
-    return valid.map((l, i) => ({
-      // 保留已保存行的 uuid id：Preview 的 po_save 靠它稳定行（不删行重插）
-      id: l.lineId,
-      line_no: i + 1,
-      item_code: l.item!.code,
-      description: l.item!.description,
-      uom: l.item!.uom,
-      qty: parseFloat(l.qty),
-      unit_price: parseFloat(l.unitPrice),
-    }))
   }
 
   const locked = poType === 'combined' && frozen

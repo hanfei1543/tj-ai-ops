@@ -2,7 +2,7 @@
 //   * 表单校验：空白/负数拒绝而不是当 0；精确 decimal string；来源分配合计必须等于实收
 //   * 草稿身份：初次保存前按 selectedPO 持久；同一 PO 不同批次绝不永久共用一个 ID
 //   * 防双击重复提交
-//   * 状态/角色文案：waiting_mapping / blocked / needs_review 中文；任务不等于 IRS 成功
+//   * 状态/角色文案：waiting_mapping / needs_review 中文；不虚构 blocked；任务不等于 IRS 成功
 //   * 静态接线：Preview 走 tj_gr_api RPC，生产 GR 入口硬 disabled，员工无 Excel 下载入口
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -302,12 +302,14 @@ test('防双击：save/submit 在飞行中一律拒绝第二次，结束后才�
 // 状态 / 角色 / 任务文案
 // ---------------------------------------------------------------------------
 
-test('收货状态：waiting_mapping / blocked / needs_review 有中文且保留原始码', () => {
+test('收货状态：waiting_mapping / needs_review 有中文且保留原始码；blocked 不是真实状态', () => {
   const waiting = receiptStatusBadge('waiting_mapping')
   assert.match(waiting.label, /等待映射/)
   assert.equal(waiting.raw, 'waiting_mapping')
+  // 服务端没有 blocked 事件状态：不虚构专门文案，未知状态如实显示原始码
   const blocked = receiptStatusBadge('blocked')
-  assert.match(blocked.label, /阻断/)
+  assert.equal(blocked.known, false)
+  assert.match(blocked.label, /blocked/)
   const review = receiptStatusBadge('needs_review')
   assert.match(review.label, /需复核/)
   // 未知状态不冒充成功
@@ -432,7 +434,7 @@ test('UI 页面：收货列表/表单/详情路由存在且员工看不到 execu
 
   const detail = read('web/src/pages/ReceiptDetailPage.tsx')
   assert.match(detail, /receipt_get|getReceipt/)
-  assert.match(detail, /needs_review|review_note/)
+  assert.match(detail, /review_required|review_note/)
   assert.match(detail, /l\.sources/)
   assert.equal(/模拟执行|mock/i.test(detail), false)
 

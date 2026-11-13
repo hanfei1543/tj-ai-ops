@@ -2,6 +2,7 @@
 
 export const DRAFT_STORAGE_PREFIX: string
 export const RECEIPT_ROLES: readonly string[]
+export const RECEIVABLE_PO_STATUSES: readonly string[]
 
 export interface DecimalOk {
   ok: true
@@ -49,6 +50,7 @@ export interface GrValidation {
   canSubmit: boolean
   requires_exception_approval: boolean
   submit_blocked_reason: string
+  has_document_number: boolean
 }
 
 export interface GrCapabilities {
@@ -83,6 +85,34 @@ export function addDecimalStrings(values: unknown[]): string
 export function compareDecimalStrings(a: unknown, b: unknown): 1 | 0 | -1
 export function normalizeRoles(raw: unknown): string[]
 export function capabilities(identity: { roles?: unknown } | null | undefined): GrCapabilities
+export function isReceivablePoStatus(status: unknown): boolean
+export function isCombinableSource(po: {
+  po_type?: string | null
+  status?: string | null
+  frozen?: boolean | null
+} | null | undefined): boolean
+export function documentNumbersPresent(header: {
+  invoice_no?: string | null
+  delivery_order_no?: string | null
+} | null | undefined): boolean
+export function receiptRedoLock(event: {
+  status?: string | null
+  released_at?: string | null
+  tasks?: unknown[] | null
+} | null | undefined): { code: string; terminal: boolean; message: string } | null
+export function buildMappingEvidence(input: {
+  checkedBy?: string | null
+  evidenceRef?: string | null
+  method?: string | null
+  confirmed?: boolean
+  now?: () => Date
+}): {
+  checked_by: string
+  checked_at: string
+  evidence_ref: string
+  method: string
+  confirmed: true
+}
 export function receiptStatusBadge(status: unknown): {
   label: string
   cls: string
@@ -123,6 +153,7 @@ export interface ReceiptDraftSession {
   begin(op: 'save' | 'submit'): boolean
   end(): void
   saveResult(event: { id?: string; revision?: number } | null | undefined): void
+  adoptDraft(input: { receipt_id?: string; revision?: number }): void
   submitResult(event: { status?: string; revision?: number } | null | undefined): void
 }
 

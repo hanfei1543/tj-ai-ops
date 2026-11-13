@@ -93,8 +93,13 @@ export default function ReceiptListPage({ identity, caps }: { identity: GrIdenti
                         {ev.event_no || shortId(ev.id)}
                       </span>
                       <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${badge.cls}`}>{badge.label}</span>
-                      {ev.needs_review && (
+                      {ev.review_required && (
                         <span className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">需复核</span>
+                      )}
+                      {Array.isArray(ev.warnings) && ev.warnings.length > 0 && (
+                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">
+                          警告 {ev.warnings.length}
+                        </span>
                       )}
                       {typeof ev.exception_count === 'number' && ev.exception_count > 0 && (
                         <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">
@@ -104,8 +109,7 @@ export default function ReceiptListPage({ identity, caps }: { identity: GrIdenti
                       <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs text-slate-600">v{ev.revision ?? 0}</span>
                     </div>
                     <div className="mt-1 truncate text-sm text-slate-700">
-                      {(ev.po_numbers && ev.po_numbers.length > 0 ? ev.po_numbers.join(' + ') : (ev.po_ids ?? []).join(' + ')) ||
-                        '（无采购单编号）'}
+                      {(ev.po_ids ?? []).join(' + ') || '（无采购单编号）'}
                       {ev.supplier_name ? ` · ${ev.supplier_name}` : ''}
                     </div>
                     <div className="mt-0.5 text-xs text-slate-400">

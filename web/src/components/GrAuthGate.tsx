@@ -5,6 +5,7 @@ import { GR_AUTH_AVAILABLE, signInWithPassword, signOutGr, useGrIdentity } from 
 import type { GrIdentity } from '@/lib/grAuth'
 import { capabilities } from '@/lib/core/gr-form.js'
 import type { GrCapabilities } from '@/lib/core/gr-form.js'
+import { IS_PREVIEW_SCHEMA } from '@/lib/supabaseClient'
 
 const ROLE_LABELS: Record<string, string> = {
   staff: '员工',
@@ -166,4 +167,14 @@ export default function GrAuthGate({ children }: { children: (identity: GrIdenti
       </div>
     </div>
   )
+}
+
+/**
+ * Preview 旧 PO 页面外壳（列表/新建/编辑/合并/商品申请）：
+ * 只在 tj_preview 要求登录（旧表 anon 读写已撤销，RPC 需要真实身份）；
+ * 生产 public 直接渲染 children —— 普通采购页面不能被收货 gate 禁用。
+ */
+export function PreviewAuthGate({ children }: { children: React.ReactNode }) {
+  if (!IS_PREVIEW_SCHEMA) return <>{children}</>
+  return <GrAuthGate>{() => children}</GrAuthGate>
 }

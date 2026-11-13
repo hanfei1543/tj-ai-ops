@@ -22,6 +22,7 @@ import {
   submitCombinedForApproval,
 } from '@/lib/tjPoApi'
 import { buildCombinedLines } from '@/lib/core/combine.js'
+import { isCombinableSource } from '@/lib/core/gr-form.js'
 import type { PoWithLines, SourceRef } from '@/types/tjPo'
 
 const CREATED_BY_OPTIONS = ['Ms Toh', 'Ngam Cheng Jye', 'Keh Lee', 'Ms Teow', 'Ah Huat']
@@ -158,10 +159,14 @@ export default function CombinePoPage() {
           setLoading(false)
           return
         }
-        // 校验均为可合并状态（未 ERP Push）
-        const bad = pos.filter((p) => p.status !== 'confirmed')
+        // 校验均为可合并来源：standard、confirmed、未冻结（后端同样拒绝其它组合）
+        const bad = pos.filter((p) => !isCombinableSource(p))
         if (bad.length) {
-          setError(`采购单 ${bad.map((p) => p.po_id).join('、')} 状态不可合并（仅 confirmed 可合并）`)
+          setError(
+            `采购单 ${bad
+              .map((p) => `${p.po_id}（${p.po_type}/${p.status}${p.frozen ? '/已冻结' : ''}）`)
+              .join('、')} 不能作为合并来源：仅未冻结的 standard confirmed 单可合并`,
+          )
           setLoading(false)
           return
         }

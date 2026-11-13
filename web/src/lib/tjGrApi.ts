@@ -31,8 +31,10 @@ export async function getSessionInfo(): Promise<GrSessionInfo> {
 }
 
 /** 收货事件列表（receipt_list → event 数组） */
-export async function listReceipts(): Promise<GrReceiptEvent[]> {
-  const res = await callGrApi<GrReceiptEvent[]>('receipt_list')
+export async function listReceipts(input: { po_id?: string } = {}): Promise<GrReceiptEvent[]> {
+  const data: Record<string, unknown> = {}
+  if (input.po_id) data.po_id = input.po_id
+  const res = await callGrApi<GrReceiptEvent[]>('receipt_list', data)
   if (!Array.isArray(res)) fail('receipt_list', '期望 event 数组')
   return res.map((ev) => asEvent(ev, 'receipt_list'))
 }
@@ -130,6 +132,14 @@ export async function poSave(input: PoSaveInput): Promise<unknown> {
   return callGrApi('po_save', { ...input })
 }
 
+/**
+ * po_get {id}：Preview 读 PO 的唯一入口（不直读旧表）。
+ * 返回完整 header + decimal string 明细；结构校验在 tjPoApi.getPo 内完成。
+ */
+export async function poGet(id: string): Promise<unknown> {
+  return callGrApi('po_get', { id })
+}
+
 /** po_push：Preview 禁止（服务端同样应拒绝）；保留给未来生产受控路径 */
 export async function poPush(input: { id: string; request_id: string }): Promise<unknown> {
   return callGrApi('po_push', { id: input.id, request_id: input.request_id })
@@ -153,7 +163,12 @@ export interface CombineLineInputDto {
   original_qty: number
   accepted_qty: number
   note: string | null
-  source_refs: Array<{ po_id: string; po_number: string; line_id: string; qty: number }>
+  source_refs: Array<{
+    po_id: string
+    po_number: string
+    line_id: string
+    qty: number | string
+  }>
 }
 
 export async function combineCreate(input: {

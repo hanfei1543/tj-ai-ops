@@ -20,7 +20,7 @@ export interface SourceRef {
   po_id: string // 来源 PO 的 uuid id
   po_number: string // 来源 PO 的显示编号 PO-000020
   line_id: string // 来源行 uuid id
-  qty: number // 该来源行贡献的订购数量
+  qty: number | string // 该来源行贡献的订购数量（Preview decimal string 原样保留）
 }
 
 export interface PoLine {
@@ -81,6 +81,20 @@ export interface PoHeader {
 
 export interface PoWithLines extends PoHeader {
   lines: PoLine[]
+}
+
+/**
+ * Preview 保存 PO 的精确输入：数量/单价是 decimal string，不经 Number。
+ * 旧生产路径在 tjPoApi 内显式转换（Excel/旧表需要 number）。
+ */
+export interface PoLineInput {
+  id?: string
+  line_no: number
+  item_code: string
+  description: string
+  uom: string | null
+  qty: string
+  unit_price: string
 }
 
 /** 合并单明细输入（CombinePoPage -> API） */

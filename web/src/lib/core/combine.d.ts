@@ -4,8 +4,8 @@ export interface CombineSourceLine {
   item_code: string
   description: string
   uom?: string | null
-  qty: number
-  unit_price: number
+  qty: number | string
+  unit_price: number | string
 }
 
 export interface CombineSourcePo {
@@ -22,7 +22,12 @@ export interface CombinedLine {
   ordered_qty: number
   accepted_qty: number
   note: string
-  source_refs: Array<{ po_id: string; po_number: string; line_id: string; qty: number }>
+  source_refs: Array<{
+    po_id: string
+    po_number: string
+    line_id: string
+    qty: number | string
+  }>
 }
 
 export declare function combineLineKey(line: CombineSourceLine): string

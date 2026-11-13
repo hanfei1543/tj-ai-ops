@@ -2,7 +2,13 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { AlertTriangle, CheckCircle2, Loader2, RefreshCw, ShieldCheck } from 'lucide-react'
 import { approveReceipt, getReceipt, releaseReceipt, setPoMapping } from '@/lib/tjGrApi'
-import { receiptStatusBadge, taskStatusBadge } from '@/lib/core/gr-form.js'
+import {
+  buildMappingEvidence,
+  documentNumbersPresent,
+  receiptRedoLock,
+  receiptStatusBadge,
+  taskStatusBadge,
+} from '@/lib/core/gr-form.js'
 import type { GrCapabilities } from '@/lib/core/gr-form.js'
 import type { GrIdentity } from '@/lib/grAuth'
 import type { GrReceiptEvent, GrTask } from '@/types/tjGr'
@@ -13,6 +19,26 @@ function fmt(iso?: string | null): string {
   if (Number.isNaN(d.getTime())) return String(iso)
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
+
+function warningText(w: unknown): string {
+  if (typeof w === 'string') return w
+  if (w && typeof w === 'object') {
+    const o = w as Record<string, unknown>
+    const code = String(o.code ?? 'warning')
+    const detail = o.detail ?? o.message
+    return detail ? `${code}：${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : code
+  }
+  return String(w ?? '')
+}
+
+interface MappingDraft {
+  irsPoNo: string
+  evidenceRef: string
+  method: string
+  confirmed: boolean
+}
+
+const EMPTY_MAPPING: MappingDraft = { irsPoNo: '', evidenceRef: '', method: '', confirmed: false }
 
 export default function ReceiptDetailPage({ identity, caps }: { identity: GrIdentity; caps: GrCapabilities }) {
   const { receiptId } = useParams()
@@ -25,7 +51,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
   const [reviewNote, setReviewNote] = useState('')
   const [allowExceptions, setAllowExceptions] = useState(false)
   const [missingMappings, setMissingMappings] = useState<string[]>([])
-  const [mappingIrs, setMappingIrs] = useState<Record<string, string>>({})
+  const [mappingDrafts, setMappingDrafts] = useState<Record<string, MappingDraft>>({})
   const [mappingBusy, setMappingBusy] = useState('')
 
   const load = useCallback(async () => {
@@ -49,8 +75,14 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
     void load()
   }, [load])
 
+  const redoLock = receiptRedoLock(event)
+
   async function handleApprove() {
     if (!event || busy) return
+    if (redoLock) {
+      setError(redoLock.message)
+      return
+    }
     const exceptions = Array.isArray(event.exceptions) ? event.exceptions : []
     if (exceptions.length > 0 && allowExceptions && !reviewNote.trim()) {
       setError('存在超收/额外行：批准必须填写复核说明（review_note）')
@@ -71,7 +103,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
         review_note: reviewNote,
       })
       setEvent(ev)
-      setNotice(`已批准放行（${receiptStatusBadge(ev.status).label}）。任务发布不等于 IRS 成功。`)
+      setNotice(`已批准（${receiptStatusBadge(ev.status).label}）。任务发布不等于 IRS 成功。`)
     } catch (e) {
       setError(e instanceof Error ? e.message : '批准失败（请刷新核对服务端状态）')
     } finally {
@@ -81,8 +113,14 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
 
   async function handleRelease() {
     if (!event || busy) return
-    if (!event.delivery_order_no) {
-      setError('放行前必须有 Delivery Order No.（合同要求）：请先在草稿补充并重新提交')
+    if (redoLock) {
+      setError(redoLock.message)
+      return
+    }
+    if (!documentNumbersPresent(event)) {
+      setError(
+        '放行前必须至少有一项 Invoice No. 或 Delivery Order No.（两者都空只能存草稿）：请先补充并重新提交',
+      )
       return
     }
     setBusy('release')
@@ -105,10 +143,27 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
     }
   }
 
+  function patchMapping(poId: string, patch: Partial<MappingDraft>) {
+    setMappingDrafts((m) => ({ ...m, [poId]: { ...(m[poId] ?? EMPTY_MAPPING), ...patch } }))
+  }
+
   async function handleSaveMapping(poHeaderId: string) {
-    const irsPoNo = (mappingIrs[poHeaderId] ?? '').trim()
-    if (!irsPoNo) {
+    const draft = mappingDrafts[poHeaderId] ?? EMPTY_MAPPING
+    // 编号原样保存：trim 只用来判空，不改写号码
+    if (!draft.irsPoNo.trim()) {
       setError('请填写 IRS PO No.（编号原样保存，不按数字格式猜）')
+      return
+    }
+    let evidence: ReturnType<typeof buildMappingEvidence>
+    try {
+      evidence = buildMappingEvidence({
+        checkedBy: identity.displayName || identity.email,
+        evidenceRef: draft.evidenceRef,
+        method: draft.method,
+        confirmed: draft.confirmed,
+      })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '映射证据不足')
       return
     }
     setMappingBusy(poHeaderId)
@@ -117,14 +172,10 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
     try {
       await setPoMapping({
         po_header_id: poHeaderId,
-        irs_po_no: irsPoNo,
-        evidence: {
-          checked_by: identity.displayName || identity.email,
-          checked_at: new Date().toISOString(),
-          note: '页面登记（approver/admin）',
-        },
+        irs_po_no: draft.irsPoNo,
+        evidence,
       })
-      setNotice('IRS PO 映射已登记。请重新点「放行」生成任务。')
+      setNotice('IRS PO 映射已登记（含可核查证据）。请重新点「放行」生成任务。')
       await load()
     } catch (e) {
       setError(e instanceof Error ? e.message : '映射登记失败')
@@ -155,9 +206,19 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
 
   const badge = receiptStatusBadge(event.status)
   const canApproveNow =
-    caps.canApprove && (event.status === 'submitted' || event.status === 'needs_review')
+    caps.canApprove && !redoLock && (event.status === 'submitted' || event.status === 'needs_review')
   const canReleaseNow =
-    caps.canRelease && (event.status === 'approved' || event.status === 'waiting_mapping')
+    caps.canRelease &&
+    !redoLock &&
+    (event.status === 'approved' || event.status === 'waiting_mapping')
+  const canEditNow =
+    !redoLock && (event.status === 'draft' || event.status === 'needs_review')
+  const warnings = Array.isArray(event.warnings) ? event.warnings : []
+  const extraLines = (event.lines ?? []).filter(
+    (l) => (l.sources ?? l.source_allocations ?? []).length === 0,
+  )
+  // IRS 实际编号只来自任务回报；表头旧 irs_* 值不是放行/过账结果
+  const reportedTasks = tasks.filter((t) => t.irs_po_no || t.irs_grn_no)
 
   return (
     <div>
@@ -171,7 +232,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
             <span className="font-mono text-[11px]" title={event.id}>{event.id}</span>
             <span className={`rounded-full px-2 py-0.5 font-medium ${badge.cls}`}>{badge.label}</span>
             <span className="rounded bg-slate-100 px-2 py-0.5">v{event.revision ?? 0}</span>
-            {event.needs_review && (
+            {event.review_required && (
               <span className="rounded-full bg-red-100 px-2 py-0.5 font-medium text-red-700">需复核</span>
             )}
           </div>
@@ -197,18 +258,30 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
         </div>
       )}
 
-      {event.needs_review && (
+      {redoLock && (
+        <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <div className="font-semibold">人工核对，不可重做</div>
+          <p className="mt-1 text-xs">{redoLock.message}</p>
+        </div>
+      )}
+
+      {event.review_required && !redoLock && (
         <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          <div className="font-semibold">需复核（needs_review）</div>
+          <div className="font-semibold">需复核（review_required）</div>
           <p className="mt-1 text-xs">
-            服务端未确认保存读回，或存在超收/额外行。不能当作已批准；请审批人核对后放行。
-            {event.status_reason ? ` 原因：${event.status_reason}` : ''}
+            服务端在本次事件里发现异常（超收/额外行/疑似重复单）：不能当作已批准，请审批人逐条核对后处理。
           </p>
         </div>
       )}
-      {event.status_reason && !event.needs_review && (
-        <div className="mb-4 rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs text-slate-600">
-          服务端状态说明：{event.status_reason}
+
+      {warnings.length > 0 && (
+        <div className="mb-4 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700">
+          <div className="font-semibold">服务端警告（{warnings.length}）</div>
+          <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs">
+            {warnings.map((w, i) => (
+              <li key={i}>{warningText(w)}</li>
+            ))}
+          </ul>
         </div>
       )}
 
@@ -226,9 +299,16 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
         </div>
       )}
 
+      {extraLines.length > 0 && (
+        <div className="mb-4 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+          有 {extraLines.length} 行没有可核实的原 PO 来源分配：审批可保留，但放行会被服务端以
+          GR_EXTRA_ASSIGNMENT_REQUIRED 阻止（需人工指定来源/确认无法自动过账），不会当作成功过账。
+        </div>
+      )}
+
       <section className="mb-4 rounded-2xl border border-slate-200 bg-white p-4">
         <dl className="grid gap-x-6 gap-y-2 text-sm md:grid-cols-3">
-          <Field label="来源采购单">{event.po_numbers?.length ? event.po_numbers.join(' + ') : (event.po_ids ?? []).join(' + ') || '—'}</Field>
+          <Field label="来源采购单">{(event.po_ids ?? []).join(' + ') || '—'}</Field>
           <Field label="供应商">{event.supplier_name ? `${event.supplier_code ?? ''} ${event.supplier_name}` : '—'}</Field>
           <Field label="收货日期">{event.receive_date ?? '—'}</Field>
           <Field label="Invoice No.">{event.invoice_no || '—'}</Field>
@@ -238,10 +318,13 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
           <Field label="审批人">{event.approved_by || '—'}</Field>
           <Field label="批准时间">{fmt(event.approved_at)}</Field>
           <Field label="放行时间">{fmt(event.released_at)}</Field>
-          <Field label="IRS PO No.">{event.irs_po_no || '（为空/未登记）'}</Field>
-          <Field label="IRS GRN No.">{event.irs_grn_no || '（为空/未登记）'}</Field>
+          <Field label="异常数">{typeof event.exception_count === 'number' ? event.exception_count : (event.exceptions?.length ?? 0)}</Field>
           <Field label="备注">{event.note || '—'}</Field>
         </dl>
+        <p className="mt-2 text-[11px] text-slate-400">
+          放行条件：Invoice No. 与 Delivery Order No. 至少一项（号码原样保存）；两者都空只能存草稿。
+          IRS 实际编号以本机任务回报为准，不读表头旧值。
+        </p>
       </section>
 
       <section className="mb-4">
@@ -257,7 +340,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
                 <th className="px-3 py-2 text-right">订购</th>
                 <th className="px-3 py-2 text-right">实收</th>
                 <th className="px-3 py-2 text-right">单价</th>
-                <th className="px-3 py-2 text-left">来源分配（PO / 行 / 数量）</th>
+                <th className="px-3 py-2 text-left">来源分配（原始 PO / 行 / 数量）</th>
                 <th className="px-3 py-2 text-left">备注</th>
               </tr>
             </thead>
@@ -311,18 +394,25 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
                   <span className="font-mono text-[10px] text-slate-500">{t.id.slice(0, 8)}…</span>
                   <span className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">{tb.label}</span>
                   <span className="text-slate-400">原始状态：{t.status || '空'}</span>
-                  {t.message ? <span className="text-slate-500">{t.message}</span> : null}
+                  {t.irs_po_no && <span className="text-slate-600">IRS PO No.：{t.irs_po_no}</span>}
+                  {t.irs_grn_no && <span className="text-slate-600">IRS GRN No.：{t.irs_grn_no}</span>}
+                  {t.last_error ? <span className="text-red-600">{t.last_error}</span> : null}
                 </li>
               )
             })}
           </ul>
+        )}
+        {reportedTasks.length > 0 && (
+          <p className="mt-2 text-[11px] text-slate-400">
+            IRS 编号来自任务回报（tasks[].irs_po_no / irs_grn_no），不是表头历史字段；仍需人工核对是否真正过账。
+          </p>
         )}
       </section>
 
       {canApproveNow && (
         <section className="mb-4 rounded-2xl border border-emerald-200 bg-white p-4">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-700">
-            <ShieldCheck className="h-4 w-4 text-emerald-600" /> 审批放行（审批角色）
+            <ShieldCheck className="h-4 w-4 text-emerald-600" /> 审批（审批角色）
           </h2>
           <label className="mt-2 flex items-center gap-2 text-sm text-slate-700">
             <input
@@ -347,14 +437,14 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
             disabled={busy !== ''}
             className="mt-3 inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
           >
-            {busy === 'approve' ? <Loader2 className="h-4 w-4 animate-spin" /> : null} 批准并放行
+            {busy === 'approve' ? <Loader2 className="h-4 w-4 animate-spin" /> : null} 批准
           </button>
         </section>
       )}
 
       {canReleaseNow && (
         <section className="mb-4 rounded-2xl border border-slate-200 bg-white p-4">
-          <h2 className="text-sm font-semibold text-slate-700">放行（执行角色）</h2>
+          <h2 className="text-sm font-semibold text-slate-700">放行（审批角色）</h2>
           <p className="mt-1 text-xs text-slate-500">放行只生成本机任务；IRS 过账仍需本机回报，界面不会标成 IRS 成功。</p>
           <button
             type="button"
@@ -367,37 +457,76 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
         </section>
       )}
 
-      {missingMappings.length > 0 && caps.canApprove && (
+      {missingMappings.length > 0 && caps.canApprove && !redoLock && (
         <section className="mb-4 rounded-2xl border border-amber-200 bg-white p-4">
           <h2 className="text-sm font-semibold text-slate-700">待登记 IRS PO 映射（{missingMappings.length}）</h2>
           <p className="mt-1 text-xs text-slate-500">
-            没有已验证映射时 release 只会把事件置为 waiting_mapping，不会生成任务。编号按原文保存，不按数字格式猜测。
+            编号按原文保存，不按数字格式猜测。证据必须是可核查的：填写证据编号与核验方式，并明确确认已核对
+            （只写「页面登记」+ 当前时间不算核验证据）。
           </p>
-          <div className="mt-2 space-y-2">
-            {missingMappings.map((poId) => (
-              <div key={poId} className="flex flex-wrap items-center gap-2 text-xs">
-                <span className="font-mono text-slate-500" title={poId}>{poId.slice(0, 8)}…</span>
-                <input
-                  value={mappingIrs[poId] ?? ''}
-                  onChange={(e) => setMappingIrs((m) => ({ ...m, [poId]: e.target.value }))}
-                  placeholder="IRS PO No."
-                  className="w-40 rounded-lg border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-emerald-500"
-                />
-                <button
-                  type="button"
-                  onClick={() => void handleSaveMapping(poId)}
-                  disabled={mappingBusy !== ''}
-                  className="rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-900 disabled:opacity-50"
-                >
-                  {mappingBusy === poId ? '保存中…' : '登记映射'}
-                </button>
-              </div>
-            ))}
+          <div className="mt-2 space-y-3">
+            {missingMappings.map((poId) => {
+              const draft = mappingDrafts[poId] ?? EMPTY_MAPPING
+              const ready = draft.irsPoNo.trim() && draft.evidenceRef.trim() && draft.method.trim() && draft.confirmed
+              return (
+                <div key={poId} className="rounded-xl border border-slate-200 p-3">
+                  <div className="font-mono text-xs text-slate-500" title={poId}>{poId.slice(0, 8)}…</div>
+                  <div className="mt-2 grid gap-2 md:grid-cols-3">
+                    <label className="block text-[11px] text-slate-500">
+                      IRS PO No.（原样）
+                      <input
+                        value={draft.irsPoNo}
+                        onChange={(e) => patchMapping(poId, { irsPoNo: e.target.value })}
+                        placeholder="例如 5 / PO-A01"
+                        className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-emerald-500"
+                      />
+                    </label>
+                    <label className="block text-[11px] text-slate-500">
+                      可核查证据（截图/单号/文件）
+                      <input
+                        value={draft.evidenceRef}
+                        onChange={(e) => patchMapping(poId, { evidenceRef: e.target.value })}
+                        placeholder="例如 IRS 页面截图 20261113-01 / 纸单号"
+                        className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-emerald-500"
+                      />
+                    </label>
+                    <label className="block text-[11px] text-slate-500">
+                      核验方式
+                      <input
+                        value={draft.method}
+                        onChange={(e) => patchMapping(poId, { method: e.target.value })}
+                        placeholder="例如 IRS 系统查询 / 纸质单据核对"
+                        className="mt-1 w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-emerald-500"
+                      />
+                    </label>
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+                    <label className="flex items-center gap-2 text-xs text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={draft.confirmed}
+                        onChange={(e) => patchMapping(poId, { confirmed: e.target.checked })}
+                        className="h-3.5 w-3.5 accent-emerald-600"
+                      />
+                      我已核对 IRS 采购单编号与证据一致
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveMapping(poId)}
+                      disabled={mappingBusy !== '' || !ready}
+                      className="rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-900 disabled:opacity-50"
+                    >
+                      {mappingBusy === poId ? '保存中…' : '登记映射'}
+                    </button>
+                  </div>
+                </div>
+              )
+            })}
           </div>
         </section>
       )}
 
-      {event.status === 'draft' && (
+      {canEditNow && (
         <Link
           to={`/tj-po-system/receipts/${event.id}/edit`}
           className="inline-block rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"

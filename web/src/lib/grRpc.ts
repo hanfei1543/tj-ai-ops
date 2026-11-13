@@ -29,6 +29,8 @@ const GR_ERROR_HINTS: Record<string, string> = {
   GR_QTY_EXCEEDED: '超过来源行剩余可收数量（以服务端累计为准）',
   GR_EXCEPTION_NOT_ALLOWED: '存在超收/额外行：必须逐条确认例外后才能批准',
   GR_MAPPING_REQUIRED: '缺少已验证的 IRS PO 映射：请先登记映射',
+  GR_EXTRA_ASSIGNMENT_REQUIRED:
+    '存在没有可核实原 PO 来源的额外行：放行被阻止，需人工指定来源/确认无法自动过账',
   GR_TASK_STALE: '任务租约已过期且已开始保存：转人工复核，不自动重发',
   GR_CALLBACK_CONFLICT: '回调冲突：相同 callback_id 内容不同（已审计拒绝）',
   GR_CALLBACK_OUT_OF_ORDER: '回调状态倒退/跳步：已拒绝，请人工 review',
