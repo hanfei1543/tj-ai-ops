@@ -50,12 +50,56 @@ export const PUSH_INTENT_STATES = Object.freeze({
 })
 
 /** 数值归一为规范十进制串：12.50 / "12.500000" / 12.5 → 都归一到 "12.5"。
- * 保证同一存储值无论 PostgREST 以 number 或 string 返回，内容摘要一致。 */
+ * 保证同一存储值无论 PostgREST 以 number 或 string 返回，内容摘要一致。
+ *
+ * 精度安全（重要）：字符串输入绝不经过 Number —— Number 会把大数（> 2^53）或
+ * 6 位小数的长整数舍入掉。numeric(20,6) 由 PostgREST 以字符串返回，这里必须
+ * 纯字符串归一，避免内容摘要把两个不同的大数误判为同 sha。 */
 export function normalizeDecimal(v) {
-  if (v === null || v === undefined || v === '') return null
-  const n = Number(v)
-  if (!Number.isFinite(n)) return String(v)
-  return String(n)
+  if (v === null || v === undefined) return null
+  const s = String(v).trim()
+  if (s === '') return null
+  // number（JSON number，已是 float，精度在解析时定死，无法恢复）：只做有限性检查
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) return null
+    return String(v)
+  }
+  return normalizeDecimalString(s)
+}
+
+/** 展开指数记法：1e3 → 1000；1.5e-3 → 0.0015。返回 null 表示非法。 */
+function expandExponent(s) {
+  const [mant, expStr] = s.split(/[eE]/)
+  const exp = parseInt(expStr, 10)
+  if (!Number.isInteger(exp)) return null
+  const [intPart, fracPart = ''] = mant.split('.')
+  const digits = intPart + fracPart
+  const pointPos = intPart.length + exp
+  if (pointPos <= 0) return '0.' + '0'.repeat(-pointPos) + digits
+  if (pointPos >= digits.length) return digits + '0'.repeat(pointPos - digits.length)
+  return digits.slice(0, pointPos) + '.' + digits.slice(pointPos)
+}
+
+/** 纯字符串十进制归一：去正负号、展开指数、去前导零与尾随零；非法返回 null。 */
+function normalizeDecimalString(s) {
+  if (/^(nan|infinity|\+?infinity|-infinity)$/i.test(s)) return null
+  let str = s
+  let neg = false
+  if (str[0] === '+') str = str.slice(1)
+  if (str[0] === '-') {
+    neg = true
+    str = str.slice(1)
+  }
+  if (/[eE]/.test(str)) {
+    str = expandExponent(str)
+    if (str === null) return null
+  }
+  const m = /^(\d+)(?:\.(\d*))?$/.exec(str)
+  if (!m) return null
+  let intPart = m[1].replace(/^0+(?=\d)/, '')
+  let fracPart = (m[2] ?? '').replace(/0+$/, '')
+  const out = intPart + (fracPart ? '.' + fracPart : '')
+  return neg && out !== '0' ? '-' + out : out
 }
 
 /**

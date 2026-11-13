@@ -122,6 +122,8 @@ export interface PoSaveInput {
   request_id: string
   supplier_code: string
   supplier_name: string
+  /** 显式业务日期 yyyy-MM-dd：普通单保存必填，缺失/非法由服务端 GR_VALIDATION 拒绝 */
+  website_po_date: string
   notes: string | null
   created_by: string
   lines: PoSaveLineInput[]

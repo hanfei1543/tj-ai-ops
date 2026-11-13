@@ -175,27 +175,76 @@ function poSaveLines(lines: PoLineInput[]) {
   }))
 }
 
-/** 新建 PO：Preview 走 po_save RPC（事务 + 稳定行 id + 幂等 request_id）；生产保持原两次写入 */
+/** 普通 PO 的显式业务日期：缺失/格式非法都在写库前拒绝（不默认当天，不推断时间戳） */
+function requireStandardWebsitePoDate(websitePoDate: string | null | undefined): string {
+  const date = formatWebsitePoDate(websitePoDate)
+  if (!date) {
+    throw new Error(
+      'Website PO Date 必填：必须由开单/核对人显式选择业务日期后才能保存；' +
+        '系统不默认当天，也不用创建/收货/审批时间代替。'
+    )
+  }
+  return date
+}
+
+/** 保存前确认 DB 已启用 website_po_date 列：缺列即 fail closed，不落无日期单据 */
+async function assertWebsitePoDateWritable(): Promise<void> {
+  if (!(await probeWebsitePoDateColumn())) {
+    throw new Error(
+      '数据库未启用 website_po_date 列（迁移待应用）：无法保存 Website PO Date，保存已阻止。' +
+        '请先由管理员应用迁移，不能无日期继续保存。'
+    )
+  }
+}
+
+/** 读回核对：DB 实际保存的日期必须与显式选择一致，否则停止后续写入（冲突） */
+function assertWebsitePoDateReadBack(stored: unknown, expected: string): void {
+  let got: string | null
+  try {
+    got = formatWebsitePoDate(stored)
+  } catch {
+    got = String(stored)
+  }
+  if (got !== expected) {
+    throw new Error(
+      `Website PO Date 写入校验失败（读回 ${got ?? '(空)'}，期望 ${expected}）：` +
+        '判为冲突，已停止后续写入，请重新加载核对。'
+    )
+  }
+}
+
+/** 新建 PO：Preview 走 po_save RPC（事务 + 稳定行 id + 幂等 request_id）；生产保持原两次写入
+ *
+ * websitePoDate 为开单人显式选择的业务日期（yyyy-MM-dd），必填。
+ * 缺失/非法/DB 缺列/读回不一致 → fail closed，绝不静默落库无日期单据。
+ */
 export async function createPo(
   supplier: Supplier,
   lines: PoLineInput[],
   createdBy: string,
+  websitePoDate: string,
   notes: string | null = null,
   requestId: string = crypto.randomUUID()
 ): Promise<PoHeader> {
+  const date = requireStandardWebsitePoDate(websitePoDate)
+
   if (IS_PREVIEW_SCHEMA) {
     const res = await poSave({
       id: null,
       request_id: requestId,
       supplier_code: supplier.code,
       supplier_name: supplier.name,
+      website_po_date: date,
       notes: notes ?? null,
       created_by: createdBy,
       lines: poSaveLines(lines),
     })
-    return poHeaderFromRpc(res, null)
+    const header = poHeaderFromRpc(res, null)
+    assertWebsitePoDateReadBack(header.website_po_date, date)
+    return header
   }
 
+  await assertWebsitePoDateWritable()
   const { data: header, error: he } = await db
     .from('tj_po_headers')
     .insert({
@@ -204,10 +253,15 @@ export async function createPo(
       status: 'confirmed',
       po_type: 'standard',
       created_by: createdBy,
+      website_po_date: date,
     })
     .select()
     .single()
   if (he) throw he
+  if (!header) {
+    throw new Error('新建采购单失败：数据库未返回表头行，已停止写明细。')
+  }
+  assertWebsitePoDateReadBack((header as PoHeader).website_po_date, date)
 
   const poHeaderId = (header as PoHeader).id
   const rows = lines.map((l, i) => ({
@@ -226,38 +280,93 @@ export async function createPo(
   return header as PoHeader
 }
 
-/** 更新 PO：Preview 走 po_save（保留原 id + 原行 id）；生产保持「删旧行重插」旧路径 */
+/** 更新 PO：Preview 走 po_save（保留原 id + 原行 id）；生产保持「删旧行重插」旧路径
+ *
+ * 规则（最小可靠实现，不做过度重构）：
+ *   * 日期缺失/非法/DB 缺列 → 读 header 前就拒绝，不产生任何写入。
+ *   * 合并单、已冻结单据（frozen=true）、已推送/导出单据拒绝按普通单编辑。
+ *   * 条件更新以读到的旧 updated_at 为准；命中 0 行 = 已被他人改过 → 冲突报错，
+ *     且绝不删除/重写明细。
+ *   * 更新后读回日期，不一致同样判为冲突，不进入删明细步骤。
+ */
 export async function updatePo(
   id: string,
   supplier: Supplier,
   lines: PoLineInput[],
+  websitePoDate: string,
   notes: string | null = null,
   requestId: string = crypto.randomUUID(),
   createdBy: string | null = null
 ): Promise<PoHeader> {
+  const date = requireStandardWebsitePoDate(websitePoDate)
+
   if (IS_PREVIEW_SCHEMA) {
     const res = await poSave({
       id,
       request_id: requestId,
       supplier_code: supplier.code,
       supplier_name: supplier.name,
+      website_po_date: date,
       notes: notes ?? null,
       // 服务端更新时保留原表头 created_by；这里传当前开单人只作为要求字段占位
       created_by: createdBy ?? '',
       lines: poSaveLines(lines),
     })
-    return poHeaderFromRpc(res, id)
+    const header = poHeaderFromRpc(res, id)
+    assertWebsitePoDateReadBack(header.website_po_date, date)
+    return header
   }
 
-  const { error: he } = await db
+  await assertWebsitePoDateWritable()
+
+  const { data: old, error: re } = await db
+    .from('tj_po_headers')
+    .select('*')
+    .eq('id', id)
+    .single()
+  if (re) throw re
+  if (!old) throw new Error('采购单不存在，无法更新。')
+  if ((old as PoHeader).po_type === 'combined') {
+    throw new Error('合并单（po_type=combined）不能按普通单编辑，请在合并流程内处理。')
+  }
+  if ((old as PoHeader).frozen) {
+    throw new Error('该采购单已冻结（frozen=true），不能修改明细或 Website PO Date。')
+  }
+  if ((old as PoHeader).status === 'pending_push' || (old as PoHeader).status === 'exported') {
+    throw new Error(
+      '该采购单已进入推送/导出流程（status=' +
+        (old as PoHeader).status +
+        '），不能修改明细或 Website PO Date，避免导出内容与单据身份漂移。'
+    )
+  }
+
+  let patchQuery = db
     .from('tj_po_headers')
     .update({
       supplier_code: supplier.code,
       supplier_name: supplier.name,
+      website_po_date: date,
       updated_at: new Date().toISOString(),
     })
     .eq('id', id)
-  if (he) throw he
+  if ((old as PoHeader).updated_at) {
+    patchQuery = patchQuery.eq('updated_at', (old as PoHeader).updated_at)
+  }
+  const { data: updated, error: he } = await patchQuery.select('*').single()
+  if (he) {
+    if ((he as { code?: string }).code === 'PGRST116') {
+      throw new Error(
+        '采购单已被他人修改（updated_at 冲突），本次更新已拒绝且未改动明细，请重新加载后再保存。'
+      )
+    }
+    throw he
+  }
+  if (!updated) {
+    throw new Error(
+      '采购单已被他人修改（updated_at 冲突），本次更新已拒绝且未改动明细，请重新加载后再保存。'
+    )
+  }
+  assertWebsitePoDateReadBack((updated as PoHeader).website_po_date, date)
 
   const { error: del } = await db.from('tj_po_lines').delete().eq('po_header_id', id)
   if (del) throw del
@@ -274,9 +383,7 @@ export async function updatePo(
   const { error: le } = await db.from('tj_po_lines').insert(rows)
   if (le) throw le
 
-  const { data, error } = await db.from('tj_po_headers').select('*').eq('id', id).single()
-  if (error) throw error
-  return data as PoHeader
+  return updated as PoHeader
 }
 
 /** 拖曳/上移下移后立即持久化顺序：按给定 line id 顺序重写 line_no（原地更新，不删行） */

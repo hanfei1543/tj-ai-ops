@@ -31,6 +31,7 @@ import {
 import type { Item, PoHeader, PoLineInput, Supplier } from '@/types/tjPo'
 import { isCombinableSource, isReceivablePoStatus } from '@/lib/core/gr-form.js'
 import { toPoLineInputs } from '@/lib/core/po-input.js'
+import { formatWebsitePoDate } from '@/lib/core/po-lines.js'
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -587,6 +588,8 @@ function PoEditor({
   const [createdBy, setCreatedBy] = useState<string | null>(null)
   const [showPersonPicker, setShowPersonPicker] = useState(false)
   const [frozen, setFrozen] = useState(false)
+  // 显式业务日期：空串表示未选择（绝不默认当天，也不从创建/审批时间推断）
+  const [websitePoDate, setWebsitePoDate] = useState('')
   const [poStatus, setPoStatus] = useState('')
   const [poType, setPoType] = useState('standard')
   const [dragIndex, setDragIndex] = useState<number | null>(null)
@@ -620,7 +623,12 @@ function PoEditor({
           }))
         )
         setCreatedBy(po.created_by ?? null)
-        setFrozen(!!po.frozen)
+        // 已冻结，或已进入推送/导出流程 → 日期与明细编辑锁定
+        setFrozen(
+          !!po.frozen || po.status === 'pending_push' || po.status === 'exported'
+        )
+        // 旧历史 null 不回填：初始保持空，由操作员显式选择后才随保存写入
+        setWebsitePoDate(po.website_po_date ?? '')
         setPoStatus(po.status)
         setPoType(po.po_type || 'standard')
       })
@@ -738,19 +746,31 @@ function PoEditor({
       setError('已批准冻结的合并单不能在普通编辑器保存：请用合并单页面按 ID 查看')
       return null
     }
+    let date: string
+    try {
+      const normalized = formatWebsitePoDate(websitePoDate)
+      if (!normalized) {
+        setError('Website PO Date 必填：请选择业务日期后再保存（不默认当天，也不用创建/审批时间代替）')
+        return null
+      }
+      date = normalized
+    } catch (e: any) {
+      setError(e.message || 'Website PO Date 格式非法，必须为 yyyy-MM-dd')
+      return null
+    }
     const parsed = buildLines()
     if (!parsed) return null
     setSaving(true)
     setError('')
     try {
       if (savedPoId) {
-        const po = await updatePo(savedPoId, supplier!, parsed, notes, poRequestId.current, createdBy)
+        const po = await updatePo(savedPoId, supplier!, parsed, date, notes, poRequestId.current, createdBy)
         setSavedPoId(po.id)
         setPoStatus(po.status)
         setFrozen(!!po.frozen)
         return po
       }
-      const po = await createPo(supplier!, parsed, by ?? createdBy ?? '', notes, poRequestId.current)
+      const po = await createPo(supplier!, parsed, by ?? createdBy ?? '', date, notes, poRequestId.current)
       setSavedPoId(po.id)
       setPoStatus(po.status)
       return po
@@ -763,8 +783,12 @@ function PoEditor({
   }
 
   async function handleSave() {
-    // 新建单：先选开单人
+    // 新建单：先选开单人（日期必填在 doSave 里再校验，这里先拦缺日期给出明确提示）
     if (!savedPoId && !createdBy) {
+      if (!websitePoDate.trim()) {
+        setError('Website PO Date 必填：请先选择业务日期（不默认当天）')
+        return
+      }
       setShowPersonPicker(true)
       return
     }
@@ -877,6 +901,25 @@ function PoEditor({
               }
             }}
           />
+        </section>
+
+        {/* Website PO Date（显式业务日期，导出 PAD 必填） */}
+        <section className="mb-5">
+          <label htmlFor="website-po-date" className="mb-1.5 block text-sm font-medium text-slate-600">
+            Website PO Date（业务日期）
+          </label>
+          <input
+            id="website-po-date"
+            type="date"
+            value={websitePoDate}
+            onChange={(e) => setWebsitePoDate(e.target.value)}
+            disabled={frozen || saving}
+            className="w-full rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 disabled:bg-slate-100 disabled:text-slate-400 md:w-64"
+          />
+          <p className="mt-1 text-xs text-slate-400">
+            PAD 导出必填：按采购业务日期手动选择；不默认当天，也不用创建/审批时间代替。
+            已冻结或已推送/导出的单据不可修改。
+          </p>
         </section>
 
         {/* 商品行 */}
