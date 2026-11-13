@@ -174,6 +174,28 @@ async function main() {
   }
   log('PASS', '事件 canonical/hash JS==SQL')
 
+  // ---- 任务 payload canonical 对照（离线复算：只从 payload 自身） -------------
+  const tasksCore = await import(pathToFileURL(path.join(ROOT, 'web/src/lib/core/receipt-tasks.js')))
+  const TASK1 = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+  const taskPayloadRow = await db.query(
+    'select tj_preview.tj_gr_task_payload($1::uuid, $2::uuid, $3::uuid, $4::text, $5::text) as p',
+    [TASK1, EV, P1, '5', 'e'.repeat(64)],
+  )
+  const taskPayload = taskPayloadRow.rows[0].p
+  const sqlTaskCanon = await db.query('select tj_preview.tj_gr_task_canonical($1::jsonb) as c', [
+    JSON.stringify(taskPayload),
+  ])
+  const jsTaskCanon = tasksCore.canonicalTaskPayloadFromPayload(taskPayload)
+  if (sqlTaskCanon.rows[0].c !== jsTaskCanon) {
+    console.error('--- SQL task canonical ---\n' + sqlTaskCanon.rows[0].c)
+    console.error('--- JS task canonical ---\n' + jsTaskCanon)
+    throw new Error('任务 payload canonical JS 与 SQL 不一致')
+  }
+  const sqlTaskHash = crypto.createHash('sha256').update(sqlTaskCanon.rows[0].c).digest('hex')
+  const jsTaskHash = await tasksCore.taskPayloadHash(taskPayload)
+  if (sqlTaskHash !== jsTaskHash) throw new Error('任务 payload hash JS 与 SQL 不一致')
+  log('PASS', '任务 payload canonical/hash JS==SQL（可离线复算）')
+
   // v2 批准快照对照（合并单）
   const C1 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
   const P2 = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
@@ -282,6 +304,7 @@ async function main() {
       (select has_function_privilege('anon','public.tj_gr_api(text,jsonb)','EXECUTE')) as anon_exec,
       (select has_table_privilege('authenticated','public.tj_gr_receipt_events','INSERT')) as auth_insert,
       (select has_table_privilege('authenticated','public.tj_po_headers','UPDATE')) as legacy_update,
+      (select has_schema_privilege('service_role','public','USAGE')) as service_role_usage,
       (select count(*)::int from pg_catalog.pg_trigger t
          join pg_catalog.pg_class c on c.oid = t.tgrelid
          join pg_catalog.pg_namespace n on n.oid = c.relnamespace
@@ -293,6 +316,7 @@ async function main() {
     ['public anon 无 EXECUTE', p.anon_exec === false],
     ['public authenticated 不能直插 GR 表', p.auth_insert === false],
     ['public 旧表直写未被本轮收紧（另有授权）', p.legacy_update === true],
+    ['public service_role USAGE 保持 true（未动 DYT/原有权限）', p.service_role_usage === true],
     ['既有 freeze guard 仍存在', p.freeze_guards === 1],
   ]) {
     if (!ok) throw new Error(`public 读回断言失败：${label}`)

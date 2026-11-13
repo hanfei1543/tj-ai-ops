@@ -21,6 +21,8 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import os from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { canonicalTaskPayloadFromPayload } from '../web/src/lib/core/receipt-tasks.js'
+import { canonicalEventPayload } from '../web/src/lib/core/receipt-core.js'
 
 export const DISPATCH_SCHEMA = 'tj.gr.dispatch.v1'
 const FORBIDDEN_VALUE = /(https?:\/\/|\\\\|PO_Queue|[A-Za-z]:\\\\)/i
@@ -110,6 +112,64 @@ export function validateDispatchRow(row, index = 0) {
   const hash = row.payload_sha256
   if (!/^[0-9a-f]{64}$/.test(String(hash ?? ''))) {
     refuse('GR_DISPATCH_HASH', `第 ${index} 行 payload_sha256 不是 64 位 hex`)
+  }
+
+  // 4b) 离线复算：payload 必须自带完整事件快照（全部行+来源），否则无法验证
+  const payload = row.payload ?? {}
+  const snapshot = payload.approved_event_snapshot
+  const scopeLines = payload.scope?.lines
+  if (
+    !snapshot ||
+    typeof snapshot !== 'object' ||
+    !Array.isArray(snapshot.lines) ||
+    snapshot.lines.length === 0 ||
+    !Array.isArray(scopeLines) ||
+    scopeLines.length === 0 ||
+    !payload.task ||
+    !payload.mapping
+  ) {
+    refuse(
+      'GR_DISPATCH_PAYLOAD_INCOMPLETE',
+      `第 ${index} 行 payload 缺少完整 approved_event_snapshot/scope/task/mapping（无法离线重算哈希）`,
+    )
+  }
+
+  // 4c) source_refs 必须覆盖快照里本轮任务的每一条来源分配（不多不少）
+  const lineIds = new Set(scopeLines.map((l) => String(l?.line_id ?? '')))
+  const expectedAlloc = new Set()
+  for (const line of snapshot.lines) {
+    if (!lineIds.has(String(line?.id ?? ''))) continue
+    for (const s of Array.isArray(line.sources) ? line.sources : []) {
+      expectedAlloc.add(`${line.id}|${s.po_line_id}|${String(s.accepted_qty)}`)
+    }
+  }
+  const refs = Array.isArray(payload.source_refs) ? payload.source_refs : []
+  const gotAlloc = new Set(refs.map((r) => `${r.receipt_line_id}|${r.po_line_id}|${String(r.accepted_qty)}`))
+  if (expectedAlloc.size === 0 || gotAlloc.size !== expectedAlloc.size) {
+    refuse('GR_DISPATCH_PAYLOAD_INCOMPLETE', `第 ${index} 行 source_refs 与 scope 来源分配数量不一致`)
+  }
+  for (const key of expectedAlloc) {
+    if (!gotAlloc.has(key)) {
+      refuse('GR_DISPATCH_PAYLOAD_INCOMPLETE', `第 ${index} 行 source_refs 缺少分配：${key}`)
+    }
+  }
+
+  // 4d) 真正重算：payload_sha256 必须等于 payload canonical 的 sha256
+  const recomputed = sha256Hex(canonicalTaskPayloadFromPayload(payload))
+  if (recomputed !== String(hash)) {
+    refuse(
+      'GR_DISPATCH_HASH_MISMATCH',
+      `第 ${index} 行 payload_sha256 与内容重算不一致（文件里 ${hash}，重算 ${recomputed}）`,
+    )
+  }
+
+  // 4e) 事件快照哈希必须能独立复算（与 release 时冻结的 event_payload_sha256 一致）
+  const eventHash = sha256Hex(canonicalEventPayload(snapshot))
+  if (eventHash !== String(payload.event_payload_sha256 ?? '')) {
+    refuse(
+      'GR_DISPATCH_EVENT_HASH_MISMATCH',
+      `第 ${index} 行 event_payload_sha256 与快照重算不一致（文件里 ${payload.event_payload_sha256}，重算 ${eventHash}）`,
+    )
   }
 
   const hits = []

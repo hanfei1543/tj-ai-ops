@@ -1,7 +1,9 @@
-# GR（统一收货）契约 v1 — `tj_gr_api`
+# GR（统一收货）第一版设计档案 — 已被安全修正版取代
+
+本文件以下正文保留为第一版设计历史，不再是可执行契约。尤其旧文中的 DO 必填、combine 来源 frozen=true、helper 权限、回执字段和 public 权限描述不得使用。实际实现契约请先读 `docs/gr-contract-v1-preview.md`，以当前 SQL/RPC、共享生成器和真实验收证据为准。
 
 > 状态：**PREPARED（仅 tj_preview 实现；public 版本只准备、需人工门禁）**。
-> 本文是 UI 与数据库之间唯一契约。UI 不得依赖本文以外的字段/状态/错误文本；
+> 以下为已取代的设计历史；实际 UI/数据库契约见安全修正版文档。
 > 数据库实现：`supabase/migrations/20261113_gr_unified_preview.sql`；
 > public 版本：`supabase/migrations/gr_unified_public_prepared.sql`（未带版本号，
 > Supabase CLI 不会自动套用；另有 SQL 门禁，见 §13）。

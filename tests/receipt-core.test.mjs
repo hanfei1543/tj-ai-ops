@@ -228,3 +228,13 @@ test('事件哈希：任何实质字段变化都改变 hash', async () => {
   // 未变化必须稳定
   assert.equal(h1, await eventPayloadHash(structuredClone(ev)))
 })
+
+test('IRS 发票号解析：有发票号用发票号，否则用 DO 原字符串，都不猜', async () => {
+  const { resolveIrsInvoiceNo } = await import('../web/src/lib/core/receipt-core.js')
+  assert.equal(resolveIrsInvoiceNo({ invoice_no: 'INV-1', delivery_order_no: 'DO-1' }), 'INV-1')
+  assert.equal(resolveIrsInvoiceNo({ invoice_no: '  ', delivery_order_no: 'DO-1' }), 'DO-1')
+  assert.equal(resolveIrsInvoiceNo({ invoice_no: null, delivery_order_no: 'DO-9' }), 'DO-9')
+  assert.equal(resolveIrsInvoiceNo({ invoice_no: '', delivery_order_no: null }), null)
+  // 原样返回（不 trim、不改大小写）
+  assert.equal(resolveIrsInvoiceNo({ invoice_no: ' Inv 01 ', delivery_order_no: 'DO-1' }), ' Inv 01 ')
+})

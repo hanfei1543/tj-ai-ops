@@ -185,6 +185,17 @@ export function encodeValue(v) {
   return escapeValue(v)
 }
 
+/**
+ * IRS 发票号解析（B8）：有发票号用发票号，否则用 DO 原字符串；都为空返回 null。
+ * 只判断“是否非空白”，返回值**原样**（不 trim、不改大小写），因为要进哈希与 IRS 比对。
+ */
+export function resolveIrsInvoiceNo({ invoice_no, delivery_order_no } = {}) {
+  const nonBlank = (v) => typeof v === 'string' && v.trim() !== ''
+  if (nonBlank(invoice_no)) return invoice_no
+  if (nonBlank(delivery_order_no)) return delivery_order_no
+  return null
+}
+
 /** 时间戳 → UTC `YYYY-MM-DDTHH:MM:SSZ`（秒精度；非法时间抛错，不猜） */
 export function timestampText(value, field = 'timestamp') {
   if (value === null || value === undefined || value === '') return null

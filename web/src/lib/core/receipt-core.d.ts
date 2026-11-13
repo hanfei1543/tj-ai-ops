@@ -116,6 +116,11 @@ export declare function decimalToMicros(value: unknown): bigint
 export declare function microsToDecimal(micros: bigint): string
 export declare function escapeValue(v: unknown): string
 export declare function encodeValue(v: unknown): string
+export declare function resolveIrsInvoiceNo(event: {
+  invoice_no?: string | null
+  delivery_order_no?: string | null
+}): string | null
+
 export declare function timestampText(value: unknown, field?: string): string | null
 export declare function canonicalFromKeyValues(pairs: Array<[string, unknown]>): string
 export declare function eventKeyValues(event: Partial<NormalizedEvent> & Record<string, unknown>): Array<[string, unknown]>

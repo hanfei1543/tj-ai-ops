@@ -54,3 +54,32 @@ test('public 版保留既有护栏（不关闭 freeze/push/IRS guard）', async 
   }
   assert.ok(!/drop\s+trigger[^;]*trg_tj_po_header_frozen_guard/i.test(text), '不得 drop 既有 freeze guard')
 })
+
+test('public 版不得把「service_role 禁入 public」整块带过去（B9）', async () => {
+  const text = await readFile(OUT, 'utf8')
+  // 预览库才允许整体撤 service_role；public 里 DYT / 推送器 / 全局默认权限必须保留
+  assert.ok(!/revoke\s+all\s+on\s+schema\s+public\s+from\s+service_role/i.test(text), '不得撤 public schema USAGE')
+  assert.ok(
+    !/revoke\s+all\s+on\s+all\s+tables\s+in\s+schema\s+public\s+from\s+service_role/i.test(text),
+    '不得批量撤 public 表的 service_role 权限（会打穿 DYT）',
+  )
+  assert.ok(
+    !/revoke\s+all\s+on\s+all\s+functions\s+in\s+schema\s+public\s+from\s+service_role/i.test(text),
+    '不得批量撤 public 函数的 service_role 权限',
+  )
+  assert.ok(
+    !/revoke\s+all\s+on\s+all\s+sequences\s+in\s+schema\s+public\s+from\s+service_role/i.test(text),
+    '不得批量撤 public 序列的 service_role 权限',
+  )
+  assert.ok(!text.includes('PREVIEW_ONLY_SERVICE_ROLE_LOCKOUT'), '预览专属块必须被剥离')
+  // 读回期望写清楚：public 的 service_role USAGE 仍是 true（原有权限）
+  assert.match(text, /has_schema_privilege\('service_role',\s*'public',\s*'USAGE'\);\s*--\s*期望 true/)
+})
+
+test('public 版明确声明旧 anon 宽权限是生产阻塞（不得声称已生产安全）', async () => {
+  const text = await readFile(OUT, 'utf8')
+  assert.match(text, /生产阻塞/)
+  assert.match(text, /anon/)
+  assert.match(text, /PREPARED/)
+})
+

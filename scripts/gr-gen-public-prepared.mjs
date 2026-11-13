@@ -24,6 +24,10 @@ const OUT = path.join(ROOT, 'supabase/migrations/gr_unified_public_prepared.sql'
 
 const BLOCK_START = '-- >>> PREVIEW_ONLY_LEGACY_HARDENING_BEGIN'
 const BLOCK_END = '-- <<< PREVIEW_ONLY_LEGACY_HARDENING_END'
+// 预览库专属：service_role 整体禁入 tj_preview。public 版必须剔除——
+// public 上 service_role / DYT / 默认权限是既有生产依赖，不能因为 GR 迁移被撤掉。
+const SR_BLOCK_START = '-- >>> PREVIEW_ONLY_SERVICE_ROLE_LOCKOUT_BEGIN'
+const SR_BLOCK_END = '-- <<< PREVIEW_ONLY_SERVICE_ROLE_LOCKOUT_END'
 
 export const BANNER = `-- ============================================================================
 -- TJ-AI-Ops — 统一收货（GR）安全内核：生产 public 版
@@ -54,6 +58,15 @@ export const BANNER = `-- ======================================================
 --       select has_table_privilege('authenticated','public.tj_gr_receipt_events','INSERT'); -- 期望 false
 --   * 生产旧表仍是 anon 宽松权限（本轮**不**收敛）：GR 新表与 RPC 不依赖 anon；
 --     收敛 public 直写必须另立授权与回归（普通单仍在用 anon 写路径）。
+--
+-- 【生产阻塞（P0，未解决前不得声称生产安全）】
+--   * public 的 tj_po_headers / tj_po_lines / tj_po_exports / tj_item_requests 仍是
+--     **anon 全量读写**（MVP 权限）。本轮只隔离 GR 新对象，没有也不能顺手收紧旧表：
+--     普通单前端仍用 anon 键写。必须先迁移旧写到登录 + RPC，再由单独授权收敛，
+--     否则任何持有 anon key 的访问者都能改/删 PO 与收货来源。
+--   * 因此本文件只是 **PREPARED**：不自动套用、不改变 service_role / DYT /
+--     public 默认权限（service_role 对 public 的 USAGE 保持 true）。
+--   * 收紧 service_role 禁入 schema 是预览库专属（tj_preview），public 版已剔除该块。
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
@@ -73,13 +86,22 @@ $gr_gate$;
 
 `
 
-function generate(source) {
-  const startIdx = source.indexOf(BLOCK_START)
-  const endIdx = source.indexOf(BLOCK_END)
+function stripBlock(source, startMarker, endMarker, label) {
+  const startIdx = source.indexOf(startMarker)
+  const endIdx = source.indexOf(endMarker)
   if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
-    throw new Error('预览迁移缺少 PREVIEW_ONLY_LEGACY_HARDENING 标记块')
+    throw new Error(`预览迁移缺少 ${label} 标记块`)
   }
-  const stripped = source.slice(0, startIdx) + source.slice(endIdx + BLOCK_END.length)
+  return source.slice(0, startIdx) + source.slice(endIdx + endMarker.length)
+}
+
+function generate(source) {
+  const stripped = stripBlock(
+    stripBlock(source, BLOCK_START, BLOCK_END, 'PREVIEW_ONLY_LEGACY_HARDENING'),
+    SR_BLOCK_START,
+    SR_BLOCK_END,
+    'PREVIEW_ONLY_SERVICE_ROLE_LOCKOUT',
+  )
 
   // 去掉预览版头部注释（到第一段分隔线之后），换成 public 横幅
   const firstDdl = stripped.indexOf('-- ----------------------------------------------------------------------------\n-- 0) 前置检查')

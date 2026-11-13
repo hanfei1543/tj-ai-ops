@@ -20,11 +20,20 @@
 -- 【安全模型】
 --   * 写只走 security definer RPC：tj_preview.tj_gr_api(text, jsonb)
 --     set search_path=''，全部对象 schema 限定；revoke public/anon，只 grant authenticated。
+--   * B1：本轮 40+ 个 tj_gr_* 函数**全部** revoke public/anon/authenticated
+--     （内部 helper 连 service_role 也 revoke）；只有 tj_gr_api / tj_gr_is_member /
+--     tj_gr_roles 三个入口 grant 给 authenticated。迁移末尾会硬校验并 raise。
 --   * 新表 RLS：只有 authenticated + membership 的 SELECT 策略；无写策略，
 --     权限层也 revoke 直写 → 直连 PostgREST 改不了业务数据。
 --   * service_role 不获 tj_preview USAGE（本文件不 grant，且显式 revoke）。
---   * tj_preview 旧 6 表：撤 authenticated 直写，只留 membership 读策略。
---     （public 版不做这一步：public 旧表仍是 MVP anon 权限，等单独授权。）
+--   * B4：tj_preview 旧 6 表撤 anon + authenticated 全部写（含 truncate/references/
+--     trigger 与 sequence），删除旧 anon ALL 策略，只留 membership 只读策略；
+--     既有 freeze/push/IRS guards 一律不动。
+--     （public 版不做这一步：public 旧表仍是 MVP anon 权限 = 已知生产阻塞，等单独授权。）
+--   * 来源关系为真 FK + ON DELETE RESTRICT（line_sources → po_headers/po_lines，
+--     po_mappings/tasks → po_headers）；event_check 对缺失/变更来源 fail closed。
+--   * 契约已知笔误：docs/gr-contract.md 写“来源 confirmed + frozen=true”，实现按
+--     confirmed + frozen=false（冻结单不能并）；文档需主脑单独修正。
 --
 -- 【回滚】见文件末尾。
 -- ============================================================================
@@ -238,6 +247,13 @@ create table if not exists tj_preview.tj_gr_audit (
 
 create index if not exists idx_tj_gr_audit_at on tj_preview.tj_gr_audit (at);
 
+-- 1.11 结构化 IRS 回执字段（verified 时写入；不塞进 evidence JSON 里当备注）
+alter table tj_preview.tj_gr_receipt_events add column if not exists irs_grn_no text;
+alter table tj_preview.tj_gr_receipt_events add column if not exists irs_invoice_no text;
+alter table tj_preview.tj_gr_tasks add column if not exists irs_grn_no text;
+alter table tj_preview.tj_gr_tasks add column if not exists irs_invoice_no text;
+alter table tj_preview.tj_gr_tasks add column if not exists evidence_ref text;
+
 -- ----------------------------------------------------------------------------
 -- 2) 基础助手：错误 / 身份 / 角色 / 十进制 / 哈希 / 规范化
 -- ----------------------------------------------------------------------------
@@ -438,6 +454,134 @@ immutable
 set search_path = ''
 as $fn$
   select case when p_value is null then null else pg_catalog.to_char(p_value, 'YYYY-MM-DD') end
+$fn$;
+
+create or replace function tj_preview.tj_gr_assert_source_po(p_header_id uuid)
+returns tj_preview.tj_po_headers
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $fn$
+declare
+  h tj_preview.tj_po_headers%rowtype;
+begin
+  if p_header_id is null then
+    perform tj_preview.tj_gr_fail('GR_SOURCE_MISSING', '来源 PO 为空');
+  end if;
+
+  select * into h from tj_preview.tj_po_headers where id = p_header_id;
+  if not found then
+    perform tj_preview.tj_gr_fail('GR_SOURCE_MISSING', '来源 PO 不存在（禁止静默跳过）',
+      pg_catalog.jsonb_build_object('po_header_id', p_header_id));
+  end if;
+
+  if h.po_type is distinct from 'standard' then
+    perform tj_preview.tj_gr_fail('GR_SOURCE_MISMATCH',
+      '收货来源必须是原始 standard PO 明细行（合并单合成行不能直接做余额）',
+      pg_catalog.jsonb_build_object('po_header_id', p_header_id, 'po_type', h.po_type));
+  end if;
+
+  if h.status not in ('confirmed', 'exported', 'combined') then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      pg_catalog.format('来源 PO 当前状态 %s 不能作为收货来源（pending_push/combining/draft/cancelled 拒绝）', h.status),
+      pg_catalog.jsonb_build_object('po_header_id', p_header_id, 'status', h.status));
+  end if;
+
+  return h;
+end
+$fn$;
+
+create or replace function tj_preview.tj_gr_event_snapshot_json(p_event_id uuid)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $fn$
+declare
+  e tj_preview.tj_gr_receipt_events%rowtype;
+  v_lines jsonb;
+begin
+  select * into e from tj_preview.tj_gr_receipt_events where id = p_event_id;
+  if not found then
+    return null;
+  end if;
+
+  select coalesce(pg_catalog.jsonb_agg(
+    pg_catalog.jsonb_build_object(
+      'id', l.id,
+      'line_no', l.line_no,
+      'item_code', l.item_code,
+      'description', l.description,
+      'uom', l.uom,
+      'unit_price', tj_preview.tj_gr_dec_text(l.unit_price),
+      'ordered_qty', tj_preview.tj_gr_dec_text(l.ordered_qty),
+      'accepted_qty', tj_preview.tj_gr_dec_text(l.accepted_qty),
+      'note', l.note,
+      'sources', coalesce((
+        select pg_catalog.jsonb_agg(
+          pg_catalog.jsonb_build_object(
+            'po_header_id', s.po_header_id,
+            'po_line_id', s.po_line_id,
+            'ordered_qty', tj_preview.tj_gr_dec_text(s.ordered_qty),
+            'accepted_qty', tj_preview.tj_gr_dec_text(s.accepted_qty)
+          ) order by s.po_header_id::text, s.po_line_id::text
+        )
+        from tj_preview.tj_gr_line_sources s
+        where s.receipt_line_id = l.id
+      ), '[]'::jsonb)
+    ) order by l.line_no, l.id::text
+  ), '[]'::jsonb)
+  into v_lines
+  from tj_preview.tj_gr_receipt_lines l
+  where l.receipt_event_id = e.id;
+
+  return pg_catalog.jsonb_build_object(
+    'id', e.id,
+    'event_no', e.event_no,
+    'revision', e.revision,
+    'status', e.status,
+    'supplier_code', e.supplier_code,
+    'supplier_name', e.supplier_name,
+    'po_ids', to_jsonb(e.po_ids),
+    'invoice_no', e.invoice_no,
+    'delivery_order_no', e.delivery_order_no,
+    'receive_date', tj_preview.tj_gr_date_text(e.receive_date),
+    'invoice_date', tj_preview.tj_gr_date_text(e.invoice_date),
+    'checked_by', e.checked_by,
+    'approved_by', e.approved_by,
+    'approved_at', tj_preview.tj_gr_ts_text(e.approved_at),
+    'released_at', tj_preview.tj_gr_ts_text(e.released_at),
+    'allow_exceptions', e.allow_exceptions,
+    'review_note', e.review_note,
+    'note', e.note,
+    'payload_sha256', e.payload_sha256,
+    'warnings', e.warnings,
+    'exceptions', e.exceptions,
+    'created_by', e.created_by,
+    'submitted_by', e.submitted_by,
+    'submitted_at', tj_preview.tj_gr_ts_text(e.submitted_at),
+    'created_at', tj_preview.tj_gr_ts_text(e.created_at),
+    'updated_at', tj_preview.tj_gr_ts_text(e.updated_at),
+    'lines', v_lines
+  );
+end
+$fn$;
+
+create or replace function tj_preview.tj_gr_mm(p_kind text, p_field text, p_expected jsonb, p_actual jsonb, p_line_id uuid default null)
+returns jsonb
+language sql
+immutable
+set search_path = ''
+as $fn$
+  select pg_catalog.jsonb_strip_nulls(pg_catalog.jsonb_build_object(
+    'kind', p_kind,
+    'field', p_field,
+    'expected', p_expected,
+    'actual', p_actual,
+    'line_id', p_line_id
+  ))
 $fn$;
 
 -- ----------------------------------------------------------------------------
@@ -662,7 +806,10 @@ as $fn$
     'receipt_event_id', t.receipt_event_id,
     'event_revision', t.event_revision,
     'po_header_id', t.po_header_id,
+    'po_id', (select h.po_id from tj_preview.tj_po_headers h where h.id = t.po_header_id),
     'irs_po_no', t.irs_po_no,
+    'irs_grn_no', t.irs_grn_no,
+    'irs_invoice_no', t.irs_invoice_no,
     'status', t.status,
     'payload_sha256', t.payload_sha256,
     'event_payload_sha256', t.event_payload_sha256,
@@ -676,6 +823,7 @@ as $fn$
     'saved_at', tj_preview.tj_gr_ts_text(t.saved_at),
     'verified_at', tj_preview.tj_gr_ts_text(t.verified_at),
     'bridge_ok', t.bridge_ok,
+    'evidence_ref', t.evidence_ref,
     'last_error', t.last_error,
     'created_at', tj_preview.tj_gr_ts_text(t.created_at),
     'updated_at', tj_preview.tj_gr_ts_text(t.updated_at)
@@ -697,24 +845,31 @@ as $fn$
       'line_id', l.id,
       'line_no', l.line_no,
       'item_code', l.item_code,
+      'description', l.description,
       'uom', l.uom,
       'unit_price', tj_preview.tj_gr_dec_text(l.unit_price),
-      'accepted_qty', tj_preview.tj_gr_dec_text(sc.qty),
-      'sources', sc.sources
+      'ordered_qty', tj_preview.tj_gr_dec_text(coalesce(sc.ordered_qty, 0)),
+      'accepted_qty', tj_preview.tj_gr_dec_text(coalesce(sc.qty, 0)),
+      'note', l.note,
+      'sources', coalesce(sc.sources, '[]'::jsonb)
     ) order by l.line_no, l.id::text
   ), '[]'::jsonb)
   from tj_preview.tj_gr_receipt_lines l
   join lateral (
     select
       pg_catalog.sum(s.accepted_qty) as qty,
+      pg_catalog.sum(s.ordered_qty) as ordered_qty,
       pg_catalog.jsonb_agg(
         pg_catalog.jsonb_build_object(
+          'po_header_id', s.po_header_id,
+          'po_id', h.po_id,
           'po_line_id', s.po_line_id,
           'ordered_qty', tj_preview.tj_gr_dec_text(s.ordered_qty),
           'accepted_qty', tj_preview.tj_gr_dec_text(s.accepted_qty)
         ) order by s.po_line_id::text
       ) as sources
     from tj_preview.tj_gr_line_sources s
+    join tj_preview.tj_po_headers h on h.id = s.po_header_id
     where s.receipt_line_id = l.id and s.po_header_id = p_po_header_id
     having pg_catalog.count(*) > 0
   ) sc on true
@@ -729,104 +884,245 @@ create or replace function tj_preview.tj_gr_task_payload(
   p_evidence_sha256 text
 )
 returns jsonb
-language sql
+language plpgsql
 stable
 security definer
 set search_path = ''
 as $fn$
-  select pg_catalog.jsonb_build_object(
+declare
+  e tj_preview.tj_gr_receipt_events%rowtype;
+  v_po_id text;
+  v_irs_invoice_no text;
+  v_source_refs jsonb;
+begin
+  select * into e from tj_preview.tj_gr_receipt_events where id = p_event_id;
+  if not found then
+    perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '收货事件不存在',
+      pg_catalog.jsonb_build_object('id', p_event_id));
+  end if;
+
+  select h.po_id into v_po_id from tj_preview.tj_po_headers h where h.id = p_po_header_id;
+  if not found then
+    perform tj_preview.tj_gr_fail('GR_SOURCE_MISSING', '任务来源 PO 不存在',
+      pg_catalog.jsonb_build_object('po_header_id', p_po_header_id));
+  end if;
+
+  -- IRS 发票号：有发票号用发票号，否则用 DO 原字符串（不 trim、不猜）
+  v_irs_invoice_no := case
+    when pg_catalog.btrim(coalesce(e.invoice_no, '')) <> '' then e.invoice_no
+    when pg_catalog.btrim(coalesce(e.delivery_order_no, '')) <> '' then e.delivery_order_no
+    else null
+  end;
+
+  select coalesce(pg_catalog.jsonb_agg(
+    pg_catalog.jsonb_build_object(
+      'receipt_line_id', l.id,
+      'line_no', l.line_no,
+      'po_header_id', s.po_header_id,
+      'po_id', h.po_id,
+      'po_line_id', s.po_line_id,
+      'item_code', l.item_code,
+      'description', l.description,
+      'uom', l.uom,
+      'unit_price', tj_preview.tj_gr_dec_text(l.unit_price),
+      'ordered_qty', tj_preview.tj_gr_dec_text(s.ordered_qty),
+      'accepted_qty', tj_preview.tj_gr_dec_text(s.accepted_qty)
+    ) order by l.line_no, l.id::text, s.po_line_id::text
+  ), '[]'::jsonb)
+  into v_source_refs
+  from tj_preview.tj_gr_line_sources s
+  join tj_preview.tj_gr_receipt_lines l on l.id = s.receipt_line_id
+  join tj_preview.tj_po_headers h on h.id = s.po_header_id
+  where s.receipt_event_id = p_event_id
+    and s.po_header_id = p_po_header_id;
+
+  return pg_catalog.jsonb_build_object(
     'task', pg_catalog.jsonb_build_object(
       'id', p_task_id,
       'type', 'GOODS_RECEIVE',
       'schema', 'tj.gr.v1',
       'environment', 'preview',
-      'po_header_id', p_po_header_id
+      'mock_only', true,
+      'event_revision', e.revision,
+      'po_header_id', p_po_header_id,
+      'po_id', v_po_id,
+      'irs_po_no', p_irs_po_no
     ),
     'mapping', pg_catalog.jsonb_build_object(
       'po_header_id', p_po_header_id,
+      'po_id', v_po_id,
       'irs_po_no', p_irs_po_no,
+      'irs_invoice_no', v_irs_invoice_no,
       'evidence_sha256', p_evidence_sha256
     ),
-    'event_payload_sha256', e.payload_sha256,
-    'event', pg_catalog.jsonb_build_object(
-      'id', e.id,
-      'revision', e.revision,
-      'supplier_code', e.supplier_code,
-      'supplier_name', e.supplier_name,
-      'invoice_no', e.invoice_no,
-      'delivery_order_no', e.delivery_order_no,
-      'receive_date', tj_preview.tj_gr_date_text(e.receive_date),
-      'invoice_date', tj_preview.tj_gr_date_text(e.invoice_date),
-      'checked_by', e.checked_by,
-      'approved_by', e.approved_by::text,
-      'approved_at', tj_preview.tj_gr_ts_text(e.approved_at)
-    ),
+    'event_payload_sha256', tj_preview.tj_gr_event_hash(p_event_id),
+    'approved_event_snapshot', tj_preview.tj_gr_event_snapshot_json(p_event_id),
     'scope', pg_catalog.jsonb_build_object(
+      'po_header_id', p_po_header_id,
+      'po_id', v_po_id,
       'lines', tj_preview.tj_gr_task_scope(p_event_id, p_po_header_id)
-    )
-  )
-  from tj_preview.tj_gr_receipt_events e
-  where e.id = p_event_id
+    ),
+    'source_refs', v_source_refs
+  );
+end
 $fn$;
 
 -- 任务 canonical = 事件全部键 + 任务/映射/切片键（覆盖 IRS 字段全集）
-create or replace function tj_preview.tj_gr_task_canonical(p_event_id uuid, p_payload jsonb)
+create or replace function tj_preview.tj_gr_task_canonical(p_payload jsonb)
 returns text
 language sql
-stable
-security definer
+immutable
 set search_path = ''
 as $fn$
-  with ev as (
-    select k, v from tj_preview.tj_gr_event_kv(p_event_id)
+  with snap as (
+    select coalesce(p_payload -> 'approved_event_snapshot', '{}'::jsonb) as s
   ),
-  t as (
+  ev as (
+    select 'schema'::text as k, 'tj.gr.v1'::text as v
+    union all select 'kind', 'goods_receive'
+    union all select 'environment', 'preview'
+    union all select 'event.id', s ->> 'id' from snap
+    union all select 'event.event_no', s ->> 'event_no' from snap
+    union all select 'event.revision', (s ->> 'revision') from snap
+    union all select 'event.supplier_code', s ->> 'supplier_code' from snap
+    union all select 'event.supplier_name', s ->> 'supplier_name' from snap
+    union all select 'event.po_ids', (
+      select pg_catalog.string_agg(x, ',' order by x)
+      from pg_catalog.jsonb_array_elements_text(coalesce(s -> 'po_ids', '[]'::jsonb)) as t(x)
+    ) from snap
+    union all select 'event.invoice_no', s ->> 'invoice_no' from snap
+    union all select 'event.delivery_order_no', s ->> 'delivery_order_no' from snap
+    union all select 'event.receive_date', s ->> 'receive_date' from snap
+    union all select 'event.invoice_date', s ->> 'invoice_date' from snap
+    union all select 'event.checked_by', s ->> 'checked_by' from snap
+    union all select 'event.approved_by', s ->> 'approved_by' from snap
+    union all select 'event.approved_at', s ->> 'approved_at' from snap
+    union all select 'event.allow_exceptions', s ->> 'allow_exceptions' from snap
+    union all select 'event.review_note', s ->> 'review_note' from snap
+    union all select 'event.note', s ->> 'note' from snap
+    union all select 'event.payload_sha256', s ->> 'payload_sha256' from snap
+  ),
+  ol as (
     select
-      'event_payload_sha256'::text as k, p_payload ->> 'event_payload_sha256' as v
+      pg_catalog.row_number() over (
+        order by (line ->> 'line_no')::numeric, line ->> 'id'
+      ) - 1 as i,
+      line
+    from snap, pg_catalog.jsonb_array_elements(coalesce(s -> 'lines', '[]'::jsonb)) as x(line)
+  ),
+  linekv as (
+    select pg_catalog.format('lines.%s.id', pg_catalog.to_char(i, 'FM0000')) as k, line ->> 'id' as v from ol
+    union all select pg_catalog.format('lines.%s.line_no', pg_catalog.to_char(i, 'FM0000')), line ->> 'line_no' from ol
+    union all select pg_catalog.format('lines.%s.item_code', pg_catalog.to_char(i, 'FM0000')), line ->> 'item_code' from ol
+    union all select pg_catalog.format('lines.%s.description', pg_catalog.to_char(i, 'FM0000')), line ->> 'description' from ol
+    union all select pg_catalog.format('lines.%s.uom', pg_catalog.to_char(i, 'FM0000')), line ->> 'uom' from ol
+    union all select pg_catalog.format('lines.%s.unit_price', pg_catalog.to_char(i, 'FM0000')),
+      tj_preview.tj_gr_dec_text((line ->> 'unit_price')::numeric) from ol
+    union all select pg_catalog.format('lines.%s.ordered_qty', pg_catalog.to_char(i, 'FM0000')),
+      tj_preview.tj_gr_dec_text((line ->> 'ordered_qty')::numeric) from ol
+    union all select pg_catalog.format('lines.%s.accepted_qty', pg_catalog.to_char(i, 'FM0000')),
+      tj_preview.tj_gr_dec_text((line ->> 'accepted_qty')::numeric) from ol
+    union all select pg_catalog.format('lines.%s.note', pg_catalog.to_char(i, 'FM0000')), line ->> 'note' from ol
+  ),
+  osrc as (
+    select
+      ol.i,
+      pg_catalog.row_number() over (
+        partition by ol.i
+        order by src ->> 'po_header_id', src ->> 'po_line_id'
+      ) - 1 as j,
+      src
+    from ol
+    cross join lateral pg_catalog.jsonb_array_elements(coalesce(ol.line -> 'sources', '[]'::jsonb)) as x(src)
+  ),
+  srckv as (
+    select pg_catalog.format('lines.%s.sources.%s.po_header_id',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')) as k, src ->> 'po_header_id' as v from osrc
+    union all select pg_catalog.format('lines.%s.sources.%s.po_line_id',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')), src ->> 'po_line_id' from osrc
+    union all select pg_catalog.format('lines.%s.sources.%s.ordered_qty',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')),
+             tj_preview.tj_gr_dec_text((src ->> 'ordered_qty')::numeric) from osrc
+    union all select pg_catalog.format('lines.%s.sources.%s.accepted_qty',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')),
+             tj_preview.tj_gr_dec_text((src ->> 'accepted_qty')::numeric) from osrc
+  ),
+  taskkv as (
+    select 'event_payload_sha256'::text as k, p_payload ->> 'event_payload_sha256' as v
     union all select 'task.id', p_payload -> 'task' ->> 'id'
     union all select 'task.type', p_payload -> 'task' ->> 'type'
     union all select 'task.schema', p_payload -> 'task' ->> 'schema'
     union all select 'task.environment', p_payload -> 'task' ->> 'environment'
+    union all select 'task.mock_only', p_payload -> 'task' ->> 'mock_only'
+    union all select 'task.event_revision', p_payload -> 'task' ->> 'event_revision'
     union all select 'task.po_header_id', p_payload -> 'task' ->> 'po_header_id'
+    union all select 'task.po_id', p_payload -> 'task' ->> 'po_id'
+    union all select 'task.irs_po_no', p_payload -> 'task' ->> 'irs_po_no'
     union all select 'mapping.po_header_id', p_payload -> 'mapping' ->> 'po_header_id'
+    union all select 'mapping.po_id', p_payload -> 'mapping' ->> 'po_id'
     union all select 'mapping.irs_po_no', p_payload -> 'mapping' ->> 'irs_po_no'
+    union all select 'mapping.irs_invoice_no', p_payload -> 'mapping' ->> 'irs_invoice_no'
     union all select 'mapping.evidence_sha256', p_payload -> 'mapping' ->> 'evidence_sha256'
+    union all select 'scope.po_header_id', p_payload -> 'scope' ->> 'po_header_id'
+    union all select 'scope.po_id', p_payload -> 'scope' ->> 'po_id'
   ),
-  sl as (
+  osl as (
     select
-      pg_catalog.format('scope.lines.%s', pg_catalog.to_char(ord - 1, 'FM0000')) as p,
-      x.line
-    from pg_catalog.jsonb_array_elements(p_payload -> 'scope' -> 'lines')
-      with ordinality as x(line, ord)
+      pg_catalog.row_number() over (
+        order by (line ->> 'line_no')::numeric, line ->> 'line_id'
+      ) - 1 as i,
+      line
+    from pg_catalog.jsonb_array_elements(
+      coalesce(p_payload -> 'scope' -> 'lines', '[]'::jsonb)
+    ) as x(line)
   ),
-  slk as (
-    select p || '.line_id' as k, line ->> 'line_id' as v from sl
-    union all select p || '.line_no', line ->> 'line_no' from sl
-    union all select p || '.item_code', line ->> 'item_code' from sl
-    union all select p || '.uom', line ->> 'uom' from sl
-    union all select p || '.unit_price', line ->> 'unit_price' from sl
-    union all select p || '.accepted_qty', line ->> 'accepted_qty' from sl
+  scope_linekv as (
+    select pg_catalog.format('scope.lines.%s.line_id', pg_catalog.to_char(i, 'FM0000')) as k, line ->> 'line_id' as v from osl
+    union all select pg_catalog.format('scope.lines.%s.line_no', pg_catalog.to_char(i, 'FM0000')), line ->> 'line_no' from osl
+    union all select pg_catalog.format('scope.lines.%s.item_code', pg_catalog.to_char(i, 'FM0000')), line ->> 'item_code' from osl
+    union all select pg_catalog.format('scope.lines.%s.description', pg_catalog.to_char(i, 'FM0000')), line ->> 'description' from osl
+    union all select pg_catalog.format('scope.lines.%s.uom', pg_catalog.to_char(i, 'FM0000')), line ->> 'uom' from osl
+    union all select pg_catalog.format('scope.lines.%s.unit_price', pg_catalog.to_char(i, 'FM0000')),
+      tj_preview.tj_gr_dec_text((line ->> 'unit_price')::numeric) from osl
+    union all select pg_catalog.format('scope.lines.%s.ordered_qty', pg_catalog.to_char(i, 'FM0000')),
+      tj_preview.tj_gr_dec_text((line ->> 'ordered_qty')::numeric) from osl
+    union all select pg_catalog.format('scope.lines.%s.accepted_qty', pg_catalog.to_char(i, 'FM0000')),
+      tj_preview.tj_gr_dec_text((line ->> 'accepted_qty')::numeric) from osl
+    union all select pg_catalog.format('scope.lines.%s.note', pg_catalog.to_char(i, 'FM0000')), line ->> 'note' from osl
   ),
-  src as (
+  ossrc as (
     select
-      sl.p,
-      pg_catalog.format('scope.lines.%s.sources.%s', substr(sl.p, 13), pg_catalog.to_char(ord - 1, 'FM0000')) as sp,
-      s.line
-    from sl
-    cross join lateral pg_catalog.jsonb_array_elements(sl.line -> 'sources')
-      with ordinality as s(line, ord)
+      osl.i,
+      pg_catalog.row_number() over (
+        partition by osl.i
+        order by src ->> 'po_header_id', src ->> 'po_line_id'
+      ) - 1 as j,
+      src
+    from osl
+    cross join lateral pg_catalog.jsonb_array_elements(coalesce(osl.line -> 'sources', '[]'::jsonb)) as x(src)
   ),
-  srck as (
-    select sp || '.po_line_id' as k, line ->> 'po_line_id' as v from src
-    union all select sp || '.ordered_qty', line ->> 'ordered_qty' from src
-    union all select sp || '.accepted_qty', line ->> 'accepted_qty' from src
+  scope_srckv as (
+    select pg_catalog.format('scope.lines.%s.sources.%s.po_header_id',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')) as k, src ->> 'po_header_id' as v from ossrc
+    union all select pg_catalog.format('scope.lines.%s.sources.%s.po_id',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')), src ->> 'po_id' from ossrc
+    union all select pg_catalog.format('scope.lines.%s.sources.%s.po_line_id',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')), src ->> 'po_line_id' from ossrc
+    union all select pg_catalog.format('scope.lines.%s.sources.%s.ordered_qty',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')),
+             tj_preview.tj_gr_dec_text((src ->> 'ordered_qty')::numeric) from ossrc
+    union all select pg_catalog.format('scope.lines.%s.sources.%s.accepted_qty',
+             pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')),
+             tj_preview.tj_gr_dec_text((src ->> 'accepted_qty')::numeric) from ossrc
   )
   select pg_catalog.string_agg(tj_preview.tj_gr_kv(k, v), chr(10) order by k)
   from (
     select k, v from ev
-    union all select k, v from t
-    union all select k, v from slk
-    union all select k, v from srck
+    union all select k, v from linekv
+    union all select k, v from srckv
+    union all select k, v from taskkv
+    union all select k, v from scope_linekv
+    union all select k, v from scope_srckv
   ) allkv
 $fn$;
 
@@ -840,139 +1136,261 @@ set search_path = ''
 as $fn$
 declare
   t tj_preview.tj_gr_tasks%rowtype;
-  v_event jsonb;
+  v_snap jsonb;
+  v_scope jsonb;
   v_mism jsonb := '[]'::jsonb;
   v_lines jsonb;
-  v_scope jsonb;
   v_line jsonb;
   v_got jsonb;
-  v_i int;
+  v_expected_irs text;
+  v_expected_inv text;
+  v_expected_irs_invoice text;
+  v_grn text;
+  v_ref text;
+  v_saved_at timestamptz;
+  v_count int;
+  v_exp_sources jsonb;
+  v_got_sources jsonb;
+  v_src_exp jsonb;
+  v_scope_now jsonb;
+  v_payload_hash text;
 begin
   select * into t from tj_preview.tj_gr_tasks where id = p_task_id;
   if not found then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '任务不存在', pg_catalog.jsonb_build_object('task_id', p_task_id));
   end if;
 
-  v_event := t.payload -> 'event';
+  v_snap := coalesce(t.payload -> 'approved_event_snapshot', t.payload -> 'event', '{}'::jsonb);
   v_scope := coalesce(t.payload -> 'scope' -> 'lines', '[]'::jsonb);
-  v_lines := coalesce(p_evidence -> 'lines', '[]'::jsonb);
+  v_lines := p_evidence -> 'lines';
 
-  if coalesce((p_evidence ->> 'bridge_ok')::boolean, false) is not true then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','bridge','field','bridge_ok','expected',true,'actual',p_evidence -> 'bridge_ok'));
+  -- 1) bridge_ok 必须是 JSON boolean true（"yes"/"true" 一律不通过，且不 cast 报错）
+  if pg_catalog.jsonb_typeof(p_evidence -> 'bridge_ok') is distinct from 'boolean'
+     or (p_evidence -> 'bridge_ok') is distinct from 'true'::jsonb then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('bridge', 'bridge_ok', 'true'::jsonb, p_evidence -> 'bridge_ok'));
   end if;
 
-  if t.environment <> 'preview' then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','environment','field','environment','expected','preview','actual',t.environment));
+  if t.environment is distinct from 'preview' then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('environment', 'environment', to_jsonb('preview'::text), to_jsonb(t.environment)));
+  end if;
+  if t.schema_version is distinct from 'tj.gr.v1' then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('schema', 'schema', to_jsonb('tj.gr.v1'::text), to_jsonb(t.schema_version)));
   end if;
 
+  -- 2) 映射：IRS PO + GRN
   if p_evidence ->> 'irs_po_no' is distinct from t.irs_po_no then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','mapping','field','irs_po_no','expected',t.irs_po_no,'actual',p_evidence ->> 'irs_po_no'));
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('mapping', 'irs_po_no', to_jsonb(t.irs_po_no), p_evidence -> 'irs_po_no'));
   end if;
 
-  if coalesce(v_event ->> 'supplier_code','') <> coalesce(p_evidence ->> 'supplier_code','') then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','header','field','supplier_code','expected',v_event ->> 'supplier_code','actual',p_evidence ->> 'supplier_code'));
+  v_grn := nullif(pg_catalog.btrim(coalesce(p_evidence ->> 'irs_grn_no', '')), '');
+  if v_grn is null then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('mapping', 'irs_grn_no', pg_catalog.to_jsonb('nonblank'::text), p_evidence -> 'irs_grn_no'));
   end if;
 
-  if coalesce(v_event ->> 'invoice_no','') <> '' and (p_evidence ->> 'invoice_no') is distinct from (v_event ->> 'invoice_no') then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','header','field','invoice_no','expected',v_event ->> 'invoice_no','actual',p_evidence ->> 'invoice_no'));
+  -- 3) 核对证据来源 + 保存时间
+  v_ref := nullif(pg_catalog.btrim(coalesce(p_evidence ->> 'evidence_ref', '')), '');
+  if v_ref is null then
+    v_ref := nullif(pg_catalog.btrim(coalesce(p_evidence ->> 'source', '')), '');
   end if;
-
-  if coalesce(v_event ->> 'delivery_order_no','') <> '' and (p_evidence ->> 'delivery_order_no') is distinct from (v_event ->> 'delivery_order_no') then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','header','field','delivery_order_no','expected',v_event ->> 'delivery_order_no','actual',p_evidence ->> 'delivery_order_no'));
+  if v_ref is null then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('evidence', 'evidence_ref', pg_catalog.to_jsonb('nonblank'::text),
+        coalesce(p_evidence -> 'evidence_ref', p_evidence -> 'source')));
   end if;
 
   begin
-    if (p_evidence ->> 'saved_at') is null or (p_evidence ->> 'saved_at')::timestamptz is null then
-      v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'kind','header','field','saved_at','expected','timestamp','actual',p_evidence ->> 'saved_at'));
+    v_saved_at := (p_evidence ->> 'saved_at')::timestamptz;
+    if v_saved_at is null then
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('header', 'saved_at', pg_catalog.to_jsonb('timestamp'::text), p_evidence -> 'saved_at'));
     end if;
   exception when others then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','header','field','saved_at','expected','timestamp','actual',p_evidence ->> 'saved_at'));
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('header', 'saved_at', pg_catalog.to_jsonb('timestamp'::text), p_evidence -> 'saved_at'));
   end;
 
-  if pg_catalog.jsonb_typeof(v_lines) <> 'array' then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','lines','field','lines','expected','array','actual',pg_catalog.jsonb_typeof(v_lines)));
+  -- 4) 日期：收货日期必填；可选发票日期按批准原值比较，NULL 不猜日期。
+  if nullif(pg_catalog.btrim(coalesce(p_evidence ->> 'receive_date', '')), '') is null
+     or (p_evidence ->> 'receive_date') is distinct from (v_snap ->> 'receive_date') then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('header', 'receive_date', v_snap -> 'receive_date', p_evidence -> 'receive_date'));
+  end if;
+
+  if (p_evidence ->> 'invoice_date') is distinct from (v_snap ->> 'invoice_date') then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('header', 'invoice_date',
+        v_snap -> 'invoice_date', p_evidence -> 'invoice_date'));
+  end if;
+
+  -- 5) IRS 发票号（selected）：有发票号用发票号，否则 DO 原字符串
+  v_expected_inv := case
+    when pg_catalog.btrim(coalesce(v_snap ->> 'invoice_no', '')) <> '' then v_snap ->> 'invoice_no'
+    when pg_catalog.btrim(coalesce(v_snap ->> 'delivery_order_no', '')) <> '' then v_snap ->> 'delivery_order_no'
+    else null
+  end;
+  v_expected_irs_invoice := coalesce(t.payload -> 'mapping' ->> 'irs_invoice_no', v_expected_inv);
+  if v_expected_irs_invoice is null
+     or (p_evidence ->> 'irs_invoice_no') is distinct from v_expected_irs_invoice then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('mapping', 'irs_invoice_no',
+        to_jsonb(v_expected_irs_invoice), p_evidence -> 'irs_invoice_no'));
+  end if;
+
+  if coalesce(v_snap ->> 'supplier_code', '') <> coalesce(p_evidence ->> 'supplier_code', '') then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('header', 'supplier_code',
+        v_snap -> 'supplier_code', p_evidence -> 'supplier_code'));
+  end if;
+
+  if nullif(pg_catalog.btrim(coalesce(p_evidence ->> 'invoice_no', '')), '')
+       is distinct from nullif(pg_catalog.btrim(coalesce(v_snap ->> 'invoice_no', '')), '') then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('header', 'invoice_no', v_snap -> 'invoice_no', p_evidence -> 'invoice_no'));
+  end if;
+  if nullif(pg_catalog.btrim(coalesce(p_evidence ->> 'delivery_order_no', '')), '')
+       is distinct from nullif(pg_catalog.btrim(coalesce(v_snap ->> 'delivery_order_no', '')), '') then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('header', 'delivery_order_no',
+        v_snap -> 'delivery_order_no', p_evidence -> 'delivery_order_no'));
+  end if;
+
+  -- 6) 行：必须是数组；不得重复 line_id；不多不少
+  if pg_catalog.jsonb_typeof(v_lines) is distinct from 'array' then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('lines', 'lines', pg_catalog.to_jsonb('array'::text), to_jsonb(pg_catalog.jsonb_typeof(v_lines))));
     return pg_catalog.jsonb_build_object('ok', false, 'mismatches', v_mism);
   end if;
 
   if pg_catalog.jsonb_array_length(v_lines) = 0 then
-    v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-      'kind','lines','field','lines','expected',pg_catalog.jsonb_array_length(v_scope),'actual',0));
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('lines', 'lines', to_jsonb(pg_catalog.jsonb_array_length(v_scope)), '0'::jsonb));
   end if;
 
-  for v_line in
-    select value from pg_catalog.jsonb_array_elements(v_scope)
-  loop
+  select pg_catalog.count(*) into v_count
+  from (
+    select x.value ->> 'line_id' as lid
+    from pg_catalog.jsonb_array_elements(v_lines) as x
+    group by 1 having pg_catalog.count(*) > 1
+  ) d;
+  if v_count > 0 then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('line_duplicate', 'line_id', pg_catalog.to_jsonb('unique'::text), to_jsonb(v_count)));
+  end if;
+
+  for v_line in select value from pg_catalog.jsonb_array_elements(v_scope) loop
     select value into v_got
     from pg_catalog.jsonb_array_elements(v_lines)
     where value ->> 'line_id' = v_line ->> 'line_id'
     limit 1;
 
     if v_got is null then
-      v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'kind','line_missing','field','line','expected',v_line ->> 'line_id','actual',null,
-        'line_id',v_line ->> 'line_id'));
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line_missing', 'line', v_line -> 'line_id', pg_catalog.to_jsonb(null::text)));
       continue;
     end if;
 
-    if (v_got ->> 'item_code') is distinct from (v_line ->> 'item_code') then
-      v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'kind','line','field','item_code','expected',v_line ->> 'item_code','actual',v_got ->> 'item_code',
-        'line_id',v_line ->> 'line_id'));
+    if (v_got ->> 'line_no') is distinct from (v_line ->> 'line_no') then
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line', 'line_no', v_line -> 'line_no', v_got -> 'line_no', (v_line ->> 'line_id')::uuid));
     end if;
-
-    if coalesce(v_got ->> 'uom','') <> coalesce(v_line ->> 'uom','') then
-      v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'kind','line','field','uom','expected',v_line ->> 'uom','actual',v_got ->> 'uom',
-        'line_id',v_line ->> 'line_id'));
+    if (v_got ->> 'item_code') is distinct from (v_line ->> 'item_code') then
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line', 'item_code', v_line -> 'item_code', v_got -> 'item_code', (v_line ->> 'line_id')::uuid));
+    end if;
+    if coalesce(v_got ->> 'uom', '') <> coalesce(v_line ->> 'uom', '') then
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line', 'uom', v_line -> 'uom', v_got -> 'uom', (v_line ->> 'line_id')::uuid));
     end if;
 
     begin
       if tj_preview.tj_gr_dec(v_got -> 'qty', 'qty') is distinct from (v_line ->> 'accepted_qty')::numeric then
-        v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-          'kind','line','field','qty','expected',v_line ->> 'accepted_qty','actual',v_got ->> 'qty',
-          'line_id',v_line ->> 'line_id'));
+        v_mism := v_mism || pg_catalog.jsonb_build_array(
+          tj_preview.tj_gr_mm('line', 'qty', v_line -> 'accepted_qty', v_got -> 'qty', (v_line ->> 'line_id')::uuid));
       end if;
     exception when others then
-      v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'kind','line','field','qty','expected',v_line ->> 'accepted_qty','actual',v_got ->> 'qty',
-        'line_id',v_line ->> 'line_id'));
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line', 'qty', v_line -> 'accepted_qty', v_got -> 'qty', (v_line ->> 'line_id')::uuid));
     end;
 
     begin
       if tj_preview.tj_gr_dec(v_got -> 'unit_price', 'unit_price') is distinct from (v_line ->> 'unit_price')::numeric then
-        v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-          'kind','line','field','unit_price','expected',v_line ->> 'unit_price','actual',v_got ->> 'unit_price',
-          'line_id',v_line ->> 'line_id'));
+        v_mism := v_mism || pg_catalog.jsonb_build_array(
+          tj_preview.tj_gr_mm('line', 'unit_price', v_line -> 'unit_price', v_got -> 'unit_price', (v_line ->> 'line_id')::uuid));
       end if;
     exception when others then
-      v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'kind','line','field','unit_price','expected',v_line ->> 'unit_price','actual',v_got ->> 'unit_price',
-        'line_id',v_line ->> 'line_id'));
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line', 'unit_price', v_line -> 'unit_price', v_got -> 'unit_price', (v_line ->> 'line_id')::uuid));
     end;
+
+    -- 7) 来源分配逐条匹配（po_line_id + 数量），不能只给行合计
+    v_exp_sources := coalesce(v_line -> 'sources', '[]'::jsonb);
+    v_got_sources := coalesce(v_got -> 'sources', v_got -> 'source_allocations');
+
+    if pg_catalog.jsonb_typeof(v_got_sources) is distinct from 'array' then
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line', 'source_allocations',
+          to_jsonb(pg_catalog.jsonb_array_length(v_exp_sources)), pg_catalog.to_jsonb(null::text), (v_line ->> 'line_id')::uuid));
+    elsif pg_catalog.jsonb_array_length(v_got_sources) <> pg_catalog.jsonb_array_length(v_exp_sources) then
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line', 'source_allocations',
+          to_jsonb(pg_catalog.jsonb_array_length(v_exp_sources)),
+          to_jsonb(pg_catalog.jsonb_array_length(v_got_sources)), (v_line ->> 'line_id')::uuid));
+    else
+      for v_src_exp in select value from pg_catalog.jsonb_array_elements(v_exp_sources) loop
+        if not exists (
+          select 1
+          from pg_catalog.jsonb_array_elements(v_got_sources) as g
+          where (g.value ->> 'po_line_id') = (v_src_exp ->> 'po_line_id')
+            and tj_preview.tj_gr_dec(g.value -> 'accepted_qty', 'source.accepted_qty')
+                = (v_src_exp ->> 'accepted_qty')::numeric
+        ) then
+          v_mism := v_mism || pg_catalog.jsonb_build_array(
+            tj_preview.tj_gr_mm('line', 'source_allocations',
+              v_line -> 'sources', v_got_sources, (v_line ->> 'line_id')::uuid));
+        end if;
+      end loop;
+    end if;
   end loop;
 
   -- 多余行（证据里出现了该 PO 切片没有的行）
-  for v_got in
-    select value from pg_catalog.jsonb_array_elements(v_lines)
-  loop
+  for v_got in select value from pg_catalog.jsonb_array_elements(v_lines) loop
     if not exists (
       select 1 from pg_catalog.jsonb_array_elements(v_scope)
       where value ->> 'line_id' = v_got ->> 'line_id'
     ) then
-      v_mism := v_mism || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'kind','line_unexpected','field','line_id','expected',null,'actual',v_got ->> 'line_id',
-        'line_id',v_got ->> 'line_id'));
+      v_mism := v_mism || pg_catalog.jsonb_build_array(
+        tj_preview.tj_gr_mm('line_unexpected', 'line_id', pg_catalog.to_jsonb(null::text), v_got -> 'line_id',
+          nullif(v_got ->> 'line_id', '')::uuid));
     end if;
   end loop;
+
+  -- 8) scope 一致：payload 里的切片必须与当前事件重算完全一致
+  v_scope_now := tj_preview.tj_gr_task_scope(t.receipt_event_id, t.po_header_id);
+  if v_scope_now is distinct from v_scope then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('scope', 'scope', pg_catalog.to_jsonb('recomputed'::text), pg_catalog.to_jsonb('payload'::text)));
+  end if;
+
+  -- 9) 任务 payload 哈希必须能由 payload 自身复算
+  v_payload_hash := tj_preview.tj_gr_sha256(tj_preview.tj_gr_task_canonical(t.payload));
+  if v_payload_hash is distinct from t.payload_sha256 then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('task', 'payload_sha256', to_jsonb(t.payload_sha256), to_jsonb(v_payload_hash)));
+  end if;
+
+  -- 10) 事件冻结哈希：当前事件重算必须等于 release 时冻结值（且与快照一致）
+  v_payload_hash := tj_preview.tj_gr_event_hash(t.receipt_event_id);
+  if v_payload_hash is distinct from t.event_payload_sha256
+     or coalesce(v_snap ->> 'payload_sha256', '') is distinct from coalesce(t.event_payload_sha256, '') then
+    v_mism := v_mism || pg_catalog.jsonb_build_array(
+      tj_preview.tj_gr_mm('event', 'event_payload_sha256',
+        to_jsonb(t.event_payload_sha256), to_jsonb(v_payload_hash)));
+  end if;
 
   return pg_catalog.jsonb_build_object('ok', pg_catalog.jsonb_array_length(v_mism) = 0, 'mismatches', v_mism);
 end
@@ -995,6 +1413,7 @@ declare
   r record;
   v_src record;
   v_dup boolean := false;
+  v_bad int;
 begin
   select * into e from tj_preview.tj_gr_receipt_events where id = p_event_id;
   if not found then
@@ -1021,12 +1440,29 @@ begin
           tj_preview.tj_gr_dec_text(r.accepted_qty), tj_preview.tj_gr_dec_text(r.ordered_qty))));
     end if;
 
-    -- 累计余额：对每条来源分配单独判断（避免用行合计掩盖单条来源超收）。
-    -- 计入所有已批准/在途/已保存事件（与 receipt-core.js EVENT_COMMITTED_STATUSES 一致）。
+    -- 来源必须真实存在（fail closed：绝不因 inner join 静默漏校验）
+    select pg_catalog.count(*) into v_bad
+    from tj_preview.tj_gr_line_sources s
+    left join tj_preview.tj_po_lines pl on pl.id = s.po_line_id
+    left join tj_preview.tj_po_headers h on h.id = s.po_header_id
+    where s.receipt_line_id = r.id
+      and (pl.id is null or h.id is null or pl.po_header_id <> s.po_header_id);
+
+    if v_bad > 0 then
+      perform tj_preview.tj_gr_fail('GR_SOURCE_MISSING',
+        '来源 PO 明细已不存在或归属不一致：禁止继续收货/批准（fail closed）',
+        pg_catalog.jsonb_build_object('receipt_line_id', r.id, 'bad_sources', v_bad));
+    end if;
+
     for v_src in
       select
+        src.po_header_id,
         src.po_line_id,
+        src.ordered_qty,
         src.accepted_qty,
+        pl.item_code,
+        pl.uom,
+        pl.unit_price,
         coalesce(pl.original_qty, pl.qty) as po_ordered,
         coalesce((
           select pg_catalog.sum(s2.accepted_qty)
@@ -1041,6 +1477,24 @@ begin
       join tj_preview.tj_po_lines pl on pl.id = src.po_line_id
       where src.receipt_line_id = r.id
     loop
+      -- 来源 PO 关系必须仍然合法（standard / 未取消 / 未在推送或合并中）
+      perform tj_preview.tj_gr_assert_source_po(v_src.po_header_id);
+
+      -- 保存快照必须与来源当前字段一致（批准前再次核对，防止事后偷改）
+      if v_src.ordered_qty is distinct from v_src.po_ordered then
+        perform tj_preview.tj_gr_fail('GR_SOURCE_CHANGED',
+          pg_catalog.format('来源订购量已变化（快照 %s，当前 %s）',
+            tj_preview.tj_gr_dec_text(v_src.ordered_qty), tj_preview.tj_gr_dec_text(v_src.po_ordered)),
+          pg_catalog.jsonb_build_object('po_line_id', v_src.po_line_id));
+      end if;
+      if v_src.item_code is distinct from r.item_code
+         or coalesce(v_src.uom, '') is distinct from coalesce(r.uom, '')
+         or v_src.unit_price is distinct from r.unit_price then
+        perform tj_preview.tj_gr_fail('GR_SOURCE_CHANGED',
+          '来源明细的 item/uom/单价与收货快照不一致（禁止批准）',
+          pg_catalog.jsonb_build_object('po_line_id', v_src.po_line_id));
+      end if;
+
       if v_src.prev_qty + v_src.accepted_qty > v_src.po_ordered then
         v_exc := v_exc || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
           'code','over_balance','line_id',r.id,'po_line_id',v_src.po_line_id,
@@ -1058,8 +1512,8 @@ begin
       and o.status <> 'cancelled'
       and o.supplier_code = e.supplier_code
       and (
-        (e.invoice_no is not null and o.invoice_no = e.invoice_no)
-        or (e.delivery_order_no is not null and o.delivery_order_no = e.delivery_order_no)
+        (pg_catalog.btrim(coalesce(e.invoice_no, '')) <> '' and o.invoice_no = e.invoice_no)
+        or (pg_catalog.btrim(coalesce(e.delivery_order_no, '')) <> '' and o.delivery_order_no = e.delivery_order_no)
       )
   ) into v_dup;
 
@@ -1114,15 +1568,11 @@ declare
   v_po_line record;
   v_line_id uuid;
   v_seen_line_ids uuid[] := '{}';
-  v_pl_ids uuid[] := '{}';
+  v_seen_pl_ids uuid[] := '{}';
   v_warn text[] := '{}';
   v_exc jsonb := '[]'::jsonb;
-  v_dup boolean;
   v_event_no text;
   v_check jsonb;
-  v_status text;
-  v_prev numeric;
-  v_po_ordered numeric;
 begin
   v_uid := tj_preview.tj_gr_require_role(array['staff','approver']);
 
@@ -1190,13 +1640,24 @@ begin
   select pg_catalog.count(*), pg_catalog.min(h.supplier_code), pg_catalog.min(h.supplier_name)
     into v_j, v_supplier_code, v_supplier_name
   from tj_preview.tj_po_headers h
-  where h.id = any (v_po_ids) and h.status <> 'cancelled';
+  where h.id = any (v_po_ids);
 
   if v_j <> pg_catalog.array_length(v_po_ids, 1) then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', 'po_ids 含不存在的来源 PO', pg_catalog.jsonb_build_object('po_ids', to_jsonb(v_po_ids)));
   end if;
   if (select pg_catalog.count(distinct h.supplier_code) from tj_preview.tj_po_headers h where h.id = any (v_po_ids)) > 1 then
     perform tj_preview.tj_gr_fail('GR_VALIDATION', '同一收货事件只能对应同一供应商');
+  end if;
+
+  -- 每个 po_id 都必须是原始 standard PO 且处于可收货状态（B7：不信客户端）
+  if exists (
+    select 1 from tj_preview.tj_po_headers h
+    where h.id = any (v_po_ids)
+      and (h.po_type is distinct from 'standard' or h.status not in ('confirmed','exported','combined'))
+  ) then
+    perform tj_preview.tj_gr_fail('GR_SOURCE_MISMATCH',
+      'po_ids 含非 standard 或不可收货状态的 PO（合并单合成行/推送中/草稿/已取消一律拒绝）',
+      pg_catalog.jsonb_build_object('po_ids', to_jsonb(v_po_ids)));
   end if;
 
   if (p_data ->> 'receive_date') is null or (p_data ->> 'receive_date') !~ '^\d{4}-\d{2}-\d{2}$' then
@@ -1257,14 +1718,27 @@ begin
       v_j := v_j + 1;
 
       select l.id, l.po_header_id, l.item_code, l.uom, l.unit_price,
-             coalesce(l.original_qty, l.qty) as ordered
+             coalesce(l.original_qty, l.qty) as ordered,
+             h.po_type, h.status as po_status, h.po_id
         into v_po_line
       from tj_preview.tj_po_lines l
+      join tj_preview.tj_po_headers h on h.id = l.po_header_id
       where l.id = (v_src ->> 'po_line_id')::uuid;
 
       if not found then
-        perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '来源 PO 明细不存在',
+        perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '来源 PO 明细不存在（禁止静默跳过）',
           pg_catalog.jsonb_build_object('po_line_id', v_src ->> 'po_line_id'));
+      end if;
+
+      if v_po_line.po_type is distinct from 'standard' then
+        perform tj_preview.tj_gr_fail('GR_SOURCE_MISMATCH',
+          '收货来源必须是原始 standard PO 明细行（合并单合成行不能直接做余额）',
+          pg_catalog.jsonb_build_object('po_line_id', v_po_line.id, 'po_type', v_po_line.po_type));
+      end if;
+      if v_po_line.po_status not in ('confirmed','exported','combined') then
+        perform tj_preview.tj_gr_fail('GR_STATE',
+          pg_catalog.format('来源 PO 状态 %s 不能收货（pending_push/combining/draft/cancelled 拒绝）', v_po_line.po_status),
+          pg_catalog.jsonb_build_object('po_line_id', v_po_line.id, 'status', v_po_line.po_status));
       end if;
 
       if v_po_line.po_header_id::text <> (v_src ->> 'po_header_id') then
@@ -1274,6 +1748,11 @@ begin
       if not (v_po_line.po_header_id = any (v_po_ids)) then
         perform tj_preview.tj_gr_fail('GR_SOURCE_MISMATCH', '来源 PO 不在 po_ids 内');
       end if;
+      if v_po_line.id = any (v_seen_pl_ids) then
+        perform tj_preview.tj_gr_fail('GR_VALIDATION', '同一来源明细行重复分配（同一事件内只能出现一次）',
+          pg_catalog.jsonb_build_object('po_line_id', v_po_line.id));
+      end if;
+      v_seen_pl_ids := v_seen_pl_ids || v_po_line.id;
 
       -- 多来源共享商品：item / UOM / 单价必须严格对应（文本精确 + 十进制相等）
       if v_po_line.item_code <> v_item_code then
@@ -1301,7 +1780,6 @@ begin
         'ordered_qty', v_po_line.ordered,
         'accepted_qty', tj_preview.tj_gr_dec(v_src -> 'accepted_qty', 'source.accepted_qty')
       ));
-      v_pl_ids := v_pl_ids || v_po_line.id;
     end loop;
 
     if v_j > 0 and v_alloc_sum <> v_accepted then
@@ -1330,20 +1808,6 @@ begin
       'accepted_qty', v_accepted,
       'note', v_note
     ));
-
-    if v_j = 0 then
-      v_exc := v_exc || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'code','extra_line','line_id',v_line_id,'detail','该行没有来源 PO 明细（额外货品）'));
-    elsif v_accepted = 0 then
-      v_warn := v_warn || 'zero_receipt'::text;
-    elsif v_accepted < v_ordered then
-      v_warn := v_warn || 'short_receipt'::text;
-    elsif v_accepted > v_ordered then
-      v_exc := v_exc || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-        'code','over_receipt','line_id',v_line_id,
-        'detail', pg_catalog.format('实收 %s 超过订购 %s',
-          tj_preview.tj_gr_dec_text(v_accepted), tj_preview.tj_gr_dec_text(v_ordered))));
-    end if;
   end loop;
 
   -- 写 header（CAS 已由上面的锁+revision 校验保证）
@@ -1431,6 +1895,13 @@ begin
   if not found then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '收货事件不存在', pg_catalog.jsonb_build_object('id', v_id));
   end if;
+
+  -- 已释放/已有任务：幂等返回当前事件（含 tasks），绝不重算 revision/hash 或重建任务
+  if e.released_at is not null
+     or exists (select 1 from tj_preview.tj_gr_tasks t where t.receipt_event_id = v_id) then
+    return tj_preview.tj_gr_event_json(v_id);
+  end if;
+
   if e.status not in ('draft','needs_review') then
     perform tj_preview.tj_gr_fail('GR_STATE', pg_catalog.format('当前状态 %s 不能提交', e.status),
       pg_catalog.jsonb_build_object('status', e.status));
@@ -1442,6 +1913,11 @@ begin
   end if;
   if e.created_by <> v_uid then
     perform tj_preview.tj_gr_fail('GR_FORBIDDEN', '只有创建人可以提交该收货事件');
+  end if;
+
+  if not exists (select 1 from tj_preview.tj_gr_receipt_lines l
+                 where l.receipt_event_id = v_id and l.accepted_qty > 0) then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', '零收事件只能保存草稿，至少一行正数实收才能提交');
   end if;
 
   v_check := tj_preview.tj_gr_event_check(v_id);
@@ -1474,7 +1950,7 @@ declare
   v_uid uuid;
   v_id uuid := (p_data ->> 'id')::uuid;
   v_rev int := (p_data ->> 'revision')::int;
-  v_allow boolean := coalesce((p_data ->> 'allow_exceptions')::boolean, false);
+  v_allow boolean := false;
   v_note text := p_data ->> 'review_note';
   e tj_preview.tj_gr_receipt_events%rowtype;
   v_check jsonb;
@@ -1483,10 +1959,25 @@ declare
 begin
   v_uid := tj_preview.tj_gr_require_role(array['approver']);
 
+  -- allow_exceptions 必须是 JSON boolean（"yes" 一律拒绝，不静默强转；缺省/null 视为 false）
+  if p_data ? 'allow_exceptions'
+     and pg_catalog.jsonb_typeof(p_data -> 'allow_exceptions') not in ('boolean', 'null') then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', 'allow_exceptions 必须是 boolean',
+      pg_catalog.jsonb_build_object('field','allow_exceptions'));
+  end if;
+  v_allow := coalesce((p_data ->> 'allow_exceptions')::boolean, false);
+
   select * into e from tj_preview.tj_gr_receipt_events where id = v_id for update;
   if not found then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '收货事件不存在', pg_catalog.jsonb_build_object('id', v_id));
   end if;
+
+  -- 已释放/已有任务：幂等返回当前事件（含 tasks），绝不改 revision/hash/批准记录
+  if e.released_at is not null
+     or exists (select 1 from tj_preview.tj_gr_tasks t where t.receipt_event_id = v_id) then
+    return tj_preview.tj_gr_event_json(v_id);
+  end if;
+
   if e.revision <> v_rev then
     perform tj_preview.tj_gr_fail('GR_REVISION_CONFLICT',
       pg_catalog.format('修订号不匹配（库中 %s，提交 %s）', e.revision, v_rev),
@@ -1495,6 +1986,11 @@ begin
   if e.status not in ('draft','needs_review','submitted') then
     perform tj_preview.tj_gr_fail('GR_STATE', pg_catalog.format('当前状态 %s 不能批准', e.status),
       pg_catalog.jsonb_build_object('status', e.status));
+  end if;
+
+  if not exists (select 1 from tj_preview.tj_gr_receipt_lines l
+                 where l.receipt_event_id = v_id and l.accepted_qty > 0) then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', '零收事件只能保存草稿，至少一行正数实收才能批准');
   end if;
 
   -- 先锁所有来源行（按 id 排序，避免死锁），再重新校验累计余额
@@ -1569,6 +2065,10 @@ declare
   v_hash text;
   v_tasks jsonb;
   v_existing uuid;
+  v_extras jsonb;
+  v_task_pos uuid[];
+  v_bad int;
+  v_count int;
 begin
   v_uid := tj_preview.tj_gr_require_role(array['approver']);
 
@@ -1580,9 +2080,16 @@ begin
     perform tj_preview.tj_gr_fail('GR_STATE', pg_catalog.format('当前状态 %s 不能释放任务', e.status),
       pg_catalog.jsonb_build_object('status', e.status));
   end if;
-  if e.receive_date is null or e.delivery_order_no is null or btrim(e.delivery_order_no) = '' then
-    perform tj_preview.tj_gr_fail('GR_VALIDATION', '释放前必须有收货日期与 Delivery Order No',
-      pg_catalog.jsonb_build_object('receive_date', e.receive_date, 'delivery_order_no', e.delivery_order_no));
+  if e.receive_date is null then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', '释放前必须有收货日期',
+      pg_catalog.jsonb_build_object('receive_date', e.receive_date));
+  end if;
+  -- invoice-only 必须允许；但发票号与 DO 全空不得放出正式 GR
+  if pg_catalog.btrim(coalesce(e.invoice_no, '')) = ''
+     and pg_catalog.btrim(coalesce(e.delivery_order_no, '')) = '' then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION',
+      '释放前必须至少有一个单据号（Invoice No 或 Delivery Order No；invoice-only 允许，但不能两者全空）',
+      pg_catalog.jsonb_build_object('invoice_no', e.invoice_no, 'delivery_order_no', e.delivery_order_no));
   end if;
   if e.payload_sha256 is null then
     perform tj_preview.tj_gr_fail('GR_VALIDATION', '事件缺少 payload_sha256，不能释放');
@@ -1596,7 +2103,72 @@ begin
     return pg_catalog.jsonb_build_object('event', tj_preview.tj_gr_event_json(v_id), 'tasks', v_tasks, 'missing_mappings', '[]'::jsonb);
   end if;
 
-  foreach v_po in array e.po_ids loop
+  -- 0) 来源当前状态/字段必须仍与保存快照一致（不合法会 raise，绝不静默）
+  perform tj_preview.tj_gr_event_check(v_id);
+
+  -- 1) 有正数量但没有来源分配的额外行：明确阻塞，保持 approved，不静默丢任务
+  select pg_catalog.jsonb_agg(
+           pg_catalog.jsonb_build_object(
+             'line_id', l.id,
+             'line_no', l.line_no,
+             'item_code', l.item_code,
+             'accepted_qty', tj_preview.tj_gr_dec_text(l.accepted_qty)
+           ) order by l.line_no, l.id::text)
+    into v_extras
+  from tj_preview.tj_gr_receipt_lines l
+  where l.receipt_event_id = v_id
+    and l.accepted_qty > 0
+    and not exists (select 1 from tj_preview.tj_gr_line_sources s where s.receipt_line_id = l.id);
+
+  if v_extras is not null then
+    -- 明确阻塞：保持 approved（waiting_mapping 也归位 approved），不建任务、不猜归属
+    update tj_preview.tj_gr_receipt_events
+       set status = 'approved', updated_at = now()
+     where id = v_id and status = 'waiting_mapping';
+
+    insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
+    values (v_uid, 'receipt_release_blocked', 'receipt_event', v_id::text,
+            pg_catalog.jsonb_build_object('code', 'GR_EXTRA_ASSIGNMENT_REQUIRED', 'lines', v_extras));
+    return pg_catalog.jsonb_build_object(
+      'event', tj_preview.tj_gr_event_json(v_id),
+      'tasks', '[]'::jsonb,
+      'missing_mappings', '[]'::jsonb,
+      'blocked', pg_catalog.jsonb_build_object(
+        'code', 'GR_EXTRA_ASSIGNMENT_REQUIRED',
+        'message', '存在没有来源 PO 的额外行：必须由审批人指定来源后才能释放，禁止自动猜映射',
+        'lines', v_extras
+      )
+    );
+  end if;
+
+  -- 2) coverage 前置断言：每条正数量行必须恰好由来源分配覆盖
+  select pg_catalog.count(*) into v_bad
+  from tj_preview.tj_gr_receipt_lines l
+  where l.receipt_event_id = v_id
+    and l.accepted_qty > 0
+    and (select coalesce(pg_catalog.sum(s.accepted_qty), 0)
+           from tj_preview.tj_gr_line_sources s where s.receipt_line_id = l.id) <> l.accepted_qty;
+
+  if v_bad > 0 then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      pg_catalog.format('有 %s 条正数量行的来源分配合计与实收不一致，禁止释放', v_bad),
+      pg_catalog.jsonb_build_object('lines', v_bad));
+  end if;
+
+  -- 3) 只给“有正数量来源分配”的 PO 建任务；0 数量来源不要求映射、不建空任务
+  select pg_catalog.array_agg(distinct s.po_header_id order by s.po_header_id)
+    into v_task_pos
+  from tj_preview.tj_gr_line_sources s
+  join tj_preview.tj_gr_receipt_lines l on l.id = s.receipt_line_id
+  where s.receipt_event_id = v_id
+    and l.accepted_qty > 0
+    and s.accepted_qty > 0;
+
+  if v_task_pos is null or pg_catalog.array_length(v_task_pos, 1) = 0 then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', '没有正数量的收货行，不能释放任务');
+  end if;
+
+  foreach v_po in array v_task_pos loop
     if not exists (select 1 from tj_preview.tj_gr_po_mappings mm
                     where mm.po_header_id = v_po and mm.verified_at is not null) then
       v_missing := v_missing || v_po;
@@ -1617,7 +2189,7 @@ begin
     );
   end if;
 
-  foreach v_po in array e.po_ids loop
+  foreach v_po in array v_task_pos loop
     select * into m from tj_preview.tj_gr_po_mappings where po_header_id = v_po;
 
     select id into v_existing from tj_preview.tj_gr_tasks
@@ -1628,13 +2200,18 @@ begin
       v_payload := tj_preview.tj_gr_task_payload(
         v_task_id, v_id, v_po, m.irs_po_no,
         tj_preview.tj_gr_sha256(m.evidence::text));
-      v_hash := tj_preview.tj_gr_sha256(tj_preview.tj_gr_task_canonical(v_id, v_payload));
+      v_hash := tj_preview.tj_gr_sha256(tj_preview.tj_gr_task_canonical(v_payload));
 
       insert into tj_preview.tj_gr_tasks (
         id, receipt_event_id, event_revision, po_header_id, irs_po_no,
-        payload, payload_sha256, event_payload_sha256, status
+        irs_invoice_no, payload, payload_sha256, event_payload_sha256, status
       ) values (
         v_task_id, v_id, e.revision, v_po, m.irs_po_no,
+        case
+          when pg_catalog.btrim(coalesce(e.invoice_no, '')) <> '' then e.invoice_no
+          when pg_catalog.btrim(coalesce(e.delivery_order_no, '')) <> '' then e.delivery_order_no
+          else null
+        end,
         v_payload, v_hash, e.payload_sha256, 'ready'
       );
 
@@ -1647,6 +2224,41 @@ begin
       ) on conflict (request_id) do nothing;
     end if;
   end loop;
+
+  -- 4) 覆盖断言：每条正数量行的每条正数量来源分配都必须恰好进入对应 PO 的任务 scope
+  select pg_catalog.count(*) into v_bad
+  from tj_preview.tj_gr_line_sources s
+  join tj_preview.tj_gr_receipt_lines l on l.id = s.receipt_line_id
+  where s.receipt_event_id = v_id
+    and l.accepted_qty > 0
+    and s.accepted_qty > 0
+    and not exists (
+      select 1
+      from tj_preview.tj_gr_tasks t
+      where t.receipt_event_id = v_id
+        and t.po_header_id = s.po_header_id
+        and exists (
+          select 1 from pg_catalog.jsonb_array_elements(coalesce(t.payload -> 'scope' -> 'lines', '[]'::jsonb)) as x
+          where (x.value ->> 'line_id') = l.id::text
+            and exists (
+              select 1 from pg_catalog.jsonb_array_elements(coalesce(x.value -> 'sources', '[]'::jsonb)) as y
+              where (y.value ->> 'po_line_id') = s.po_line_id::text
+                and (y.value ->> 'accepted_qty')::numeric = s.accepted_qty
+            )
+        )
+    );
+
+  if v_bad > 0 then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      pg_catalog.format('任务 scope 未完整覆盖 %s 条来源分配，禁止释放', v_bad),
+      pg_catalog.jsonb_build_object('uncovered', v_bad));
+  end if;
+
+  select pg_catalog.count(*) into v_count from tj_preview.tj_gr_tasks where receipt_event_id = v_id;
+  if v_count <> pg_catalog.array_length(v_task_pos, 1) then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      pg_catalog.format('任务数 %s 与正数量来源 PO 数 %s 不一致', v_count, pg_catalog.array_length(v_task_pos, 1)));
+  end if;
 
   update tj_preview.tj_gr_receipt_events
      set status = 'released', released_by = v_uid, released_at = now(), updated_at = now()
@@ -1744,6 +2356,7 @@ declare
   v_exec uuid := nullif(p_data ->> 'executor_id','')::uuid;
   t tj_preview.tj_gr_tasks%rowtype;
   v_roles text[];
+  v_ev_status text;
 begin
   v_uid := tj_preview.tj_gr_require_role(array['executor']);
   v_roles := tj_preview.tj_gr_roles();
@@ -1757,19 +2370,55 @@ begin
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '任务不存在', pg_catalog.jsonb_build_object('task_id', v_task));
   end if;
 
-  if t.status = 'claimed' and t.lease_expires_at is not null and t.lease_expires_at < now() then
-    if t.save_attempted_at is not null then
-      update tj_preview.tj_gr_tasks
-         set status = 'needs_review', last_error = 'lease 过期且已开始保存，禁止自动重发', updated_at = now()
-       where id = v_task;
-      perform tj_preview.tj_gr_fail('GR_TASK_STALE', '任务 lease 过期且已尝试保存：转人工核对，不盲目重发',
-        pg_catalog.jsonb_build_object('task_id', v_task));
-    else
-      -- 未开始保存：允许重新领取（安全）
-      null;
-    end if;
-  elsif t.status <> 'ready'
-        and not (t.status = 'claimed' and (t.lease_expires_at is null or t.lease_expires_at < now())) then
+  -- 已开始保存（save_attempted / saved_unverified）的任务绝不允许自动重领：
+  -- 可能已在 IRS 落了一半。必须**提交** needs_review（不能 UPDATE 后 raise 回滚掉审计）。
+  if t.status in ('save_attempted','saved_unverified')
+     or (t.status = 'claimed' and t.save_attempted_at is not null
+         and (t.lease_expires_at is null or t.lease_expires_at < now())) then
+    update tj_preview.tj_gr_tasks
+       set status = 'needs_review',
+           last_error = '任务已尝试保存但未完成，禁止自动重领；转人工核对',
+           updated_at = now()
+     where id = v_task;
+
+    update tj_preview.tj_gr_receipt_events
+       set status = 'needs_review', updated_at = now()
+     where id = t.receipt_event_id
+       and status in ('released','in_progress','saved_unverified');
+
+    insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
+    values (v_uid, 'task_claim_blocked', 'gr_task', v_task::text,
+            pg_catalog.jsonb_build_object('code', 'GR_TASK_STALE_REVIEW', 'from_status', t.status));
+
+    select status into v_ev_status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id;
+
+    return pg_catalog.jsonb_build_object(
+      'task', tj_preview.tj_gr_task_json(v_task),
+      'event_status', v_ev_status,
+      'rejected', true,
+      'code', 'GR_TASK_STALE_REVIEW',
+      'message', '任务已开始保存，不能自动重领；已转人工核对（needs_review）'
+    );
+  end if;
+
+  -- 别人持有的未过期 lease：不允许抢占（返回拒绝而不是抛错）
+  if t.status = 'claimed'
+     and t.lease_expires_at is not null and t.lease_expires_at >= now()
+     and t.claimed_by is distinct from v_uid
+     and not ('admin' = any (v_roles)) then
+    insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
+    values (v_uid, 'task_claim_lease_held', 'gr_task', v_task::text,
+            pg_catalog.jsonb_build_object('claimed_by', t.claimed_by, 'lease_expires_at', t.lease_expires_at));
+    return pg_catalog.jsonb_build_object(
+      'task', tj_preview.tj_gr_task_json(v_task),
+      'event_status', (select status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id),
+      'rejected', true,
+      'code', 'GR_TASK_LEASED'
+    );
+  end if;
+
+  if t.status <> 'ready'
+     and not (t.status = 'claimed' and (t.lease_expires_at is null or t.lease_expires_at < now())) then
     perform tj_preview.tj_gr_fail('GR_STATE', pg_catalog.format('任务状态 %s 不能领取', t.status),
       pg_catalog.jsonb_build_object('status', t.status));
   end if;
@@ -1806,7 +2455,7 @@ as $fn$
 declare
   v_uid uuid;
   v_task uuid := (p_data ->> 'task_id')::uuid;
-  v_event uuid := (p_data ->> 'receipt_event_id')::uuid;
+  v_event uuid := nullif(p_data ->> 'receipt_event_id','')::uuid;
   v_hash text := p_data ->> 'payload_sha256';
   v_cb text := p_data ->> 'callback_id';
   v_type text := p_data ->> 'event_type';
@@ -1819,70 +2468,78 @@ declare
   v_next text;
   v_mism jsonb;
   v_ev_status text;
-  v_ok boolean := false;
   v_reject text;
+  v_bridge boolean := false;
+  v_grn text;
+  v_ev_ref text;
+  v_inv text;
 begin
   v_uid := tj_preview.tj_gr_require_role(array['executor']);
   v_roles := tj_preview.tj_gr_roles();
 
-  if v_cb is null or btrim(v_cb) = '' then
+  if v_cb is null or pg_catalog.btrim(v_cb) = '' then
     perform tj_preview.tj_gr_fail('GR_VALIDATION', 'callback_id 必填（幂等键）');
   end if;
   if v_type not in ('save_attempted','saved','verified','failed','needs_review') then
     perform tj_preview.tj_gr_fail('GR_VALIDATION', '未知 event_type：' || coalesce(v_type,'(null)'));
+  end if;
+  if pg_catalog.jsonb_typeof(v_evidence) is distinct from 'object' then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', 'evidence 必须是对象');
+  end if;
+  if p_data ? 'receipt_event_id'
+     and nullif(p_data ->> 'receipt_event_id', '') is not null
+     and (p_data ->> 'receipt_event_id') !~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', 'receipt_event_id 必须是 uuid',
+      pg_catalog.jsonb_build_object('field', 'receipt_event_id'));
   end if;
 
   select * into t from tj_preview.tj_gr_tasks where id = v_task for update;
   if not found then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '任务不存在', pg_catalog.jsonb_build_object('task_id', v_task));
   end if;
-
-  if t.receipt_event_id <> v_event then
-    perform tj_preview.tj_gr_fail('GR_VALIDATION', 'receipt_event_id 与任务不匹配');
-  end if;
   if t.claimed_by is null or t.status = 'ready' then
     perform tj_preview.tj_gr_fail('GR_STATE', '任务必须先 task_claim 领取后才能回报结果',
       pg_catalog.jsonb_build_object('status', t.status));
   end if;
-  if v_hash is null or v_hash <> t.payload_sha256 then
-    perform tj_preview.tj_gr_fail('GR_VALIDATION', 'payload_sha256 与任务不一致（拒绝串任务/串版本）',
-      pg_catalog.jsonb_build_object('expected', t.payload_sha256, 'actual', v_hash));
-  end if;
   if t.claimed_by is not null and t.claimed_by <> v_uid and not ('admin' = any (v_roles)) then
     perform tj_preview.tj_gr_fail('GR_FORBIDDEN', '只有任务领取者可以回报结果');
   end if;
-  if t.status = 'verified' then
-    -- verified 是终态：只允许同 callback replay，下面按幂等处理
-    null;
-  end if;
 
+  -- 指纹包含事件 id / 任务哈希：同 callback_id 换 body 一定冲突（含首次被拒的记录）
   v_fp := tj_preview.tj_gr_sha256(
-    v_task::text || '|' || v_type || '|' || coalesce(v_evidence, 'null'::jsonb)::text || '|' || coalesce(v_error, 'null'));
+    v_task::text || '|' || coalesce(v_event::text, 'null') || '|' || coalesce(v_hash, 'null')
+    || '|' || v_type || '|' || coalesce(v_evidence, pg_catalog.to_jsonb(null::text))::text || '|' || coalesce(v_error, 'null'));
 
   select * into v_prev from tj_preview.tj_gr_task_callbacks
-   where task_id = v_task and callback_id = v_cb and accepted
+   where task_id = v_task and callback_id = v_cb
    order by id desc limit 1;
 
   if found then
     if v_prev.content_sha256 = v_fp then
       insert into tj_preview.tj_gr_task_callbacks
         (task_id, callback_id, content_sha256, event_type, actor, accepted, reject_code, body)
-      values (v_task, v_cb, v_fp, v_type, v_uid, true, 'replay', v_evidence);
+      values (v_task, v_cb, v_fp, v_type, v_uid, v_prev.accepted, 'replay', v_evidence);
+      select status into v_ev_status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id;
       return pg_catalog.jsonb_build_object(
         'task', tj_preview.tj_gr_task_json(v_task),
-        'event_status', (select status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id),
+        'event_status', v_ev_status,
         'replayed', true,
-        'rejected', false
+        'rejected', not v_prev.accepted,
+        'code', case when v_prev.accepted then null else coalesce(v_prev.reject_code, 'GR_CALLBACK_CONFLICT') end,
+        'mismatches', '[]'::jsonb
       );
     end if;
+
     insert into tj_preview.tj_gr_task_callbacks
       (task_id, callback_id, content_sha256, event_type, actor, accepted, reject_code, body)
     values (v_task, v_cb, v_fp, v_type, v_uid, false, 'GR_CALLBACK_CONFLICT', v_evidence);
-    -- 不 raise：拒绝必须**提交**才能留下审计（raise 会连同审计一起回滚）。
-    -- 任务状态不变，响应里带 rejected/code 供调用方判断。
+    insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
+    values (v_uid, 'task_result_rejected', 'gr_task', v_task::text,
+            pg_catalog.jsonb_build_object('code', 'GR_CALLBACK_CONFLICT', 'callback_id', v_cb));
+    select status into v_ev_status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id;
     return pg_catalog.jsonb_build_object(
       'task', tj_preview.tj_gr_task_json(v_task),
-      'event_status', (select status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id),
+      'event_status', v_ev_status,
       'replayed', false,
       'rejected', true,
       'code', 'GR_CALLBACK_CONFLICT',
@@ -1890,8 +2547,47 @@ begin
     );
   end if;
 
-  -- 状态迁移（与 receipt-tasks.js nextTaskStatus 同规则）
-  if v_type = 'save_attempted' then
+  -- 事件 id / 任务哈希校验：用 IS DISTINCT FROM 拒绝缺失值；不 raise（审计必须持久）
+  if t.receipt_event_id is distinct from v_event then
+    insert into tj_preview.tj_gr_task_callbacks
+      (task_id, callback_id, content_sha256, event_type, actor, accepted, reject_code, body)
+    values (v_task, v_cb, v_fp, v_type, v_uid, false, 'GR_EVENT_MISMATCH', v_evidence);
+    insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
+    values (v_uid, 'task_result_rejected', 'gr_task', v_task::text,
+            pg_catalog.jsonb_build_object('code', 'GR_EVENT_MISMATCH',
+              'expected', t.receipt_event_id, 'actual', v_event));
+    return pg_catalog.jsonb_build_object(
+      'task', tj_preview.tj_gr_task_json(v_task),
+      'event_status', (select status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id),
+      'replayed', false, 'rejected', true, 'code', 'GR_EVENT_MISMATCH', 'mismatches', '[]'::jsonb
+    );
+  end if;
+
+  if t.payload_sha256 is distinct from v_hash then
+    insert into tj_preview.tj_gr_task_callbacks
+      (task_id, callback_id, content_sha256, event_type, actor, accepted, reject_code, body)
+    values (v_task, v_cb, v_fp, v_type, v_uid, false, 'GR_PAYLOAD_HASH_MISMATCH', v_evidence);
+    insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
+    values (v_uid, 'task_result_rejected', 'gr_task', v_task::text,
+            pg_catalog.jsonb_build_object('code', 'GR_PAYLOAD_HASH_MISMATCH',
+              'expected', t.payload_sha256, 'actual', v_hash));
+    return pg_catalog.jsonb_build_object(
+      'task', tj_preview.tj_gr_task_json(v_task),
+      'event_status', (select status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id),
+      'replayed', false, 'rejected', true, 'code', 'GR_PAYLOAD_HASH_MISMATCH', 'mismatches', '[]'::jsonb
+    );
+  end if;
+
+  -- bridge_ok 必须是 JSON boolean true（"yes"/"true" 不算，且不 cast 报错）
+  v_bridge := pg_catalog.jsonb_typeof(v_evidence -> 'bridge_ok') = 'boolean'
+              and (v_evidence -> 'bridge_ok') = 'true'::jsonb;
+
+  -- verified / cancelled 是终态；needs_review 只能人工处理（迟到回调不自动恢复）
+  if t.status in ('verified','cancelled') then
+    v_reject := 'GR_CALLBACK_OUT_OF_ORDER';
+  elsif t.status = 'needs_review' and v_type <> 'needs_review' then
+    v_reject := 'GR_CALLBACK_OUT_OF_ORDER';
+  elsif v_type = 'save_attempted' then
     if t.status = 'save_attempted' then
       v_next := 'save_attempted';
     elsif t.status in ('ready','claimed') then
@@ -1902,7 +2598,7 @@ begin
   elsif v_type = 'saved' then
     if t.status <> 'save_attempted' then
       v_reject := 'GR_CALLBACK_OUT_OF_ORDER';
-    elsif not coalesce((v_evidence ->> 'bridge_ok')::boolean, false) then
+    elsif not v_bridge then
       v_next := 'needs_review';
       v_error := coalesce(v_error, 'Bridge ok=false：视为失败，人工核对');
     else
@@ -1911,7 +2607,7 @@ begin
   elsif v_type = 'verified' then
     if t.status <> 'saved_unverified' then
       v_reject := 'GR_CALLBACK_OUT_OF_ORDER';
-    elsif not coalesce((v_evidence ->> 'bridge_ok')::boolean, false) then
+    elsif not v_bridge then
       v_next := 'needs_review';
       v_error := coalesce(v_error, 'Bridge ok=false：视为失败');
     else
@@ -1924,9 +2620,7 @@ begin
       end if;
     end if;
   elsif v_type = 'failed' then
-    if t.status = 'verified' then
-      v_reject := 'GR_CALLBACK_OUT_OF_ORDER';
-    elsif t.save_attempted_at is not null or t.status = 'save_attempted' then
+    if t.save_attempted_at is not null or t.status = 'save_attempted' then
       v_next := 'needs_review';
     else
       v_next := 'failed_unsaved';
@@ -1939,10 +2633,13 @@ begin
     insert into tj_preview.tj_gr_task_callbacks
       (task_id, callback_id, content_sha256, event_type, actor, accepted, reject_code, body)
     values (v_task, v_cb, v_fp, v_type, v_uid, false, v_reject, v_evidence);
-    -- 同上：乱序/倒退拒绝也不 raise（要留审计、且状态确实没变）
+    insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
+    values (v_uid, 'task_result_rejected', 'gr_task', v_task::text,
+            pg_catalog.jsonb_build_object('code', v_reject, 'from_status', t.status, 'event_type', v_type));
+    select status into v_ev_status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id;
     return pg_catalog.jsonb_build_object(
       'task', tj_preview.tj_gr_task_json(v_task),
-      'event_status', (select status from tj_preview.tj_gr_receipt_events where id = t.receipt_event_id),
+      'event_status', v_ev_status,
       'replayed', false,
       'rejected', true,
       'code', v_reject,
@@ -1950,15 +2647,25 @@ begin
     );
   end if;
 
+  v_grn := nullif(pg_catalog.btrim(coalesce(v_evidence ->> 'irs_grn_no', '')), '');
+  v_ev_ref := coalesce(
+    nullif(pg_catalog.btrim(coalesce(v_evidence ->> 'evidence_ref', '')), ''),
+    nullif(pg_catalog.btrim(coalesce(v_evidence ->> 'source', '')), ''));
+  v_inv := nullif(pg_catalog.btrim(coalesce(v_evidence ->> 'irs_invoice_no', '')), '');
+
   update tj_preview.tj_gr_tasks set
     status = v_next,
     callback_id = v_cb,
-    bridge_ok = coalesce((v_evidence ->> 'bridge_ok')::boolean, bridge_ok),
+    bridge_ok = case when pg_catalog.jsonb_typeof(v_evidence -> 'bridge_ok') = 'boolean'
+                     then (v_evidence ->> 'bridge_ok')::boolean else bridge_ok end,
     evidence = v_evidence,
     last_error = v_error,
     save_attempted_at = case when v_type = 'save_attempted' then coalesce(save_attempted_at, now()) else save_attempted_at end,
     saved_at = case when v_next in ('saved_unverified','verified') then coalesce(saved_at, now()) else saved_at end,
     verified_at = case when v_next = 'verified' then now() else verified_at end,
+    irs_grn_no = case when v_next = 'verified' then coalesce(v_grn, irs_grn_no) else irs_grn_no end,
+    irs_invoice_no = case when v_next = 'verified' then coalesce(v_inv, irs_invoice_no) else irs_invoice_no end,
+    evidence_ref = case when v_next = 'verified' then coalesce(v_ev_ref, evidence_ref) else evidence_ref end,
     lease_expires_at = case when v_next in ('verified','failed_unsaved','needs_review') then null else lease_expires_at end,
     updated_at = now()
   where id = v_task;
@@ -1982,7 +2689,10 @@ begin
     end into v_ev_status;
 
   update tj_preview.tj_gr_receipt_events
-     set status = v_ev_status, updated_at = now()
+     set status = v_ev_status,
+         irs_grn_no = case when v_next = 'verified' then coalesce(v_grn, irs_grn_no) else irs_grn_no end,
+         irs_invoice_no = case when v_next = 'verified' then coalesce(v_inv, irs_invoice_no) else irs_invoice_no end,
+         updated_at = now()
    where id = t.receipt_event_id;
 
   insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
@@ -2048,37 +2758,73 @@ $fn$;
 
 create or replace function tj_preview.tj_gr_po_json(p_id uuid)
 returns jsonb
-language sql
+language plpgsql
 stable
 security definer
 set search_path = ''
 as $fn$
-  select pg_catalog.jsonb_build_object(
+declare
+  h tj_preview.tj_po_headers%rowtype;
+  v_lines jsonb;
+begin
+  select * into h from tj_preview.tj_po_headers where id = p_id;
+  if not found then
+    return null;
+  end if;
+
+  select coalesce(pg_catalog.jsonb_agg(
+    pg_catalog.jsonb_build_object(
+      'id', l.id,
+      'line_no', l.line_no,
+      'item_code', l.item_code,
+      'description', l.description,
+      'uom', l.uom,
+      'qty', tj_preview.tj_gr_dec_text(l.qty),
+      'unit_price', tj_preview.tj_gr_dec_text(l.unit_price),
+      'original_qty', tj_preview.tj_gr_dec_text(coalesce(l.original_qty, l.qty)),
+      'ordered_qty', tj_preview.tj_gr_dec_text(coalesce(l.original_qty, l.qty)),
+      'accepted_qty', tj_preview.tj_gr_dec_text(l.accepted_qty),
+      'note', l.note,
+      'source_po_id', l.source_po_id,
+      'source_line_id', l.source_line_id,
+      'source_refs', coalesce((
+        select pg_catalog.jsonb_agg(
+          pg_catalog.jsonb_build_object(
+            'po_id', r.value ->> 'po_id',
+            'po_number', r.value ->> 'po_number',
+            'line_id', r.value ->> 'line_id',
+            'qty', tj_preview.tj_gr_dec_text(coalesce((r.value ->> 'qty')::numeric, 0))
+          ) order by r.ord
+        )
+        from pg_catalog.jsonb_array_elements(coalesce(l.source_refs, '[]'::jsonb))
+          with ordinality as r(value, ord)
+      ), '[]'::jsonb)
+    ) order by l.line_no, l.id::text
+  ), '[]'::jsonb)
+  into v_lines
+  from tj_preview.tj_po_lines l
+  where l.po_header_id = h.id;
+
+  return to_jsonb(h) || pg_catalog.jsonb_build_object(
     'id', h.id,
     'po_id', h.po_id,
-    'status', h.status,
-    'po_type', h.po_type,
-    'po_revision', h.po_revision,
-    'supplier_code', h.supplier_code,
-    'supplier_name', h.supplier_name,
-    'notes', h.notes,
-    'created_by', h.created_by,
-    'frozen', h.frozen,
     'website_po_date', tj_preview.tj_gr_date_text(h.website_po_date),
-    'lines', coalesce((
-      select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
-        'id', l.id, 'line_no', l.line_no, 'item_code', l.item_code,
-        'description', l.description, 'uom', l.uom,
-        'qty', tj_preview.tj_gr_dec_text(l.qty),
-        'unit_price', tj_preview.tj_gr_dec_text(l.unit_price),
-        'original_qty', tj_preview.tj_gr_dec_text(l.original_qty),
-        'accepted_qty', tj_preview.tj_gr_dec_text(l.accepted_qty),
-        'note', l.note
-      ) order by l.line_no, l.id::text)
-      from tj_preview.tj_po_lines l where l.po_header_id = h.id
-    ), '[]'::jsonb)
-  )
-  from tj_preview.tj_po_headers h where h.id = p_id
+    'approved_at', tj_preview.tj_gr_ts_text(h.approved_at),
+    'received_at', tj_preview.tj_gr_ts_text(h.received_at),
+    'created_at', tj_preview.tj_gr_ts_text(h.created_at),
+    'updated_at', tj_preview.tj_gr_ts_text(h.updated_at),
+    'source_po_ids', to_jsonb(h.source_po_ids),
+    'source_sha256', h.source_sha256,
+    'approval_snapshot_version', h.approval_snapshot_version,
+    -- 可离线重算的 v2 批准快照（未批准/无日期时为 null，不猜）
+    'approval_canonical', case
+      when h.website_po_date is not null and h.source_sha256 is not null
+      then tj_preview.tj_gr_approval_canonical(h.id)
+      else null
+    end,
+    'lines', v_lines
+  );
+end
 $fn$;
 
 create or replace function tj_preview.tj_gr_po_save(p_data jsonb)
@@ -2100,6 +2846,11 @@ declare
   v_ref boolean;
   v_keep uuid[] := '{}';
   v_result jsonb;
+  v_fp text;
+  v_saved_fp text;
+  v_seen_nos int[] := '{}';
+  v_no int;
+  v_existing_id uuid;
 begin
   v_uid := tj_preview.tj_gr_require_role(array['staff','approver']);
 
@@ -2112,9 +2863,23 @@ begin
     v_id := gen_random_uuid();
   end if;
 
+  -- 内容指纹（去掉 request_id/created_by）：同 id + 同内容 = 幂等重放，不再写第二份
+  v_fp := tj_preview.tj_gr_sha256(
+    (p_data - 'request_id' - 'created_by' - 'revision' - 'po_revision')::text);
+
   select * into h from tj_preview.tj_po_headers where id = v_id for update;
 
   if found then
+    select request_hash into v_saved_fp
+      from tj_preview.tj_gr_requests
+     where request_id = 'po_save:' || v_id::text;
+
+    if v_saved_fp is not null and v_saved_fp = v_fp then
+      insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
+      values (v_uid, 'po_save_replay', 'po_header', v_id::text, '{}'::jsonb);
+      return tj_preview.tj_gr_po_json(v_id);
+    end if;
+
     if h.frozen then
       perform tj_preview.tj_gr_fail('GR_STATE', '已批准冻结的 PO 不能通过 po_save 修改（po_id=' || h.po_id || '）',
         pg_catalog.jsonb_build_object('po_id', h.po_id));
@@ -2150,6 +2915,12 @@ begin
     for v_line in select value from pg_catalog.jsonb_array_elements(p_data -> 'lines') loop
       v_i := v_i + 1;
       v_line_id := nullif(v_line ->> 'id','')::uuid;
+      v_no := coalesce((v_line ->> 'line_no')::int, v_i);
+
+      if v_no = any (v_seen_nos) then
+        perform tj_preview.tj_gr_fail('GR_VALIDATION', pg_catalog.format('line_no 重复：%s', v_no));
+      end if;
+      v_seen_nos := v_seen_nos || v_no;
 
       if v_line_id is not null then
         -- 稳定明细 id：存在则更新；被收货引用时业务字段不可改
@@ -2187,31 +2958,49 @@ begin
               qty = coalesce(tj_preview.tj_gr_dec(v_line -> 'qty','qty'), qty)
             where id = v_line_id;
           end if;
+          v_keep := v_keep || v_line_id;
         else
           insert into tj_preview.tj_po_lines
             (id, po_header_id, line_no, item_code, description, uom, qty, unit_price)
           values (
-            v_line_id, v_id,
-            coalesce((v_line ->> 'line_no')::int, v_i),
+            v_line_id, v_id, v_no,
             v_line ->> 'item_code',
             v_line ->> 'description',
             v_line ->> 'uom',
             tj_preview.tj_gr_dec(v_line -> 'qty','qty'),
             tj_preview.tj_gr_dec(v_line -> 'unit_price','unit_price'));
+          v_keep := v_keep || v_line_id;
         end if;
-        v_keep := v_keep || v_line_id;
       else
-        insert into tj_preview.tj_po_lines
-          (po_header_id, line_no, item_code, description, uom, qty, unit_price)
-        values (
-          v_id,
-          coalesce((v_line ->> 'line_no')::int, v_i),
-          v_line ->> 'item_code',
-          v_line ->> 'description',
-          v_line ->> 'uom',
-          tj_preview.tj_gr_dec(v_line -> 'qty','qty'),
-          tj_preview.tj_gr_dec(v_line -> 'unit_price','unit_price'))
-        returning id into v_line_id;
+        -- 没有稳定 id：先按 (header, line_no) 找已有未引用行 → 更新而不是再插一份
+        v_existing_id := null;
+        select l.id into v_existing_id
+          from tj_preview.tj_po_lines l
+         where l.po_header_id = v_id and l.line_no = v_no
+           and not exists (select 1 from tj_preview.tj_gr_line_sources s where s.po_line_id = l.id)
+         order by l.id::text limit 1;
+
+        if v_existing_id is not null then
+          update tj_preview.tj_po_lines set
+            description = coalesce(v_line ->> 'description', description),
+            item_code = coalesce(v_line ->> 'item_code', item_code),
+            uom = coalesce(v_line ->> 'uom', uom),
+            unit_price = coalesce(tj_preview.tj_gr_dec(v_line -> 'unit_price','unit_price'), unit_price),
+            qty = coalesce(tj_preview.tj_gr_dec(v_line -> 'qty','qty'), qty)
+          where id = v_existing_id;
+          v_line_id := v_existing_id;
+        else
+          insert into tj_preview.tj_po_lines
+            (po_header_id, line_no, item_code, description, uom, qty, unit_price)
+          values (
+            v_id, v_no,
+            v_line ->> 'item_code',
+            v_line ->> 'description',
+            v_line ->> 'uom',
+            tj_preview.tj_gr_dec(v_line -> 'qty','qty'),
+            tj_preview.tj_gr_dec(v_line -> 'unit_price','unit_price'))
+          returning id into v_line_id;
+        end if;
         v_keep := v_keep || v_line_id;
       end if;
     end loop;
@@ -2228,6 +3017,12 @@ begin
     delete from tj_preview.tj_po_lines l
      where l.po_header_id = v_id and not (l.id = any (v_keep));
   end if;
+
+  -- 记录内容指纹（按 header 覆盖），供无 request_id 的重放识别
+  insert into tj_preview.tj_gr_requests(request_id, action, actor, request_hash, response)
+  values ('po_save:' || v_id::text, 'po_save_content', v_uid, v_fp, null)
+  on conflict (request_id) do update
+    set request_hash = excluded.request_hash, actor = excluded.actor;
 
   v_result := tj_preview.tj_gr_po_json(v_id);
   perform tj_preview.tj_gr_request_done('po_save', v_request, p_data, v_result);
@@ -2383,13 +3178,18 @@ declare
   v_line jsonb;
   v_ref record;
   v_i int := 0;
-  v_key text;
   v_refs jsonb;
   v_ordered numeric;
   v_accepted numeric;
   v_first_po uuid;
   v_first_line uuid;
   v_result jsonb;
+  v_l record;
+  v_qty numeric;
+  v_seen_refs uuid[] := '{}';
+  v_total_refs int := 0;
+  v_expected_lines int;
+  v_updated int;
 begin
   v_uid := tj_preview.tj_gr_require_role(array['staff','approver']);
 
@@ -2405,26 +3205,34 @@ begin
   select pg_catalog.array_agg(value::uuid) into v_sources
   from pg_catalog.jsonb_array_elements_text(p_data -> 'source_ids') as v(value);
   v_n := pg_catalog.array_length(v_sources, 1);
+  if v_n <> (select pg_catalog.count(distinct x) from pg_catalog.unnest(v_sources) x) then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', 'source_ids 含重复 PO（不得重复计数）');
+  end if;
 
   -- 锁来源单（顺序一致，避免并发同时并同一张单）
   perform 1 from tj_preview.tj_po_headers h where h.id = any (v_sources) order by h.id for update;
+
   select pg_catalog.count(*), pg_catalog.min(h.supplier_code)
     into v_i, v_supplier
   from tj_preview.tj_po_headers h where h.id = any (v_sources);
   if v_i <> v_n then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '来源 PO 不存在');
   end if;
-  if (select pg_catalog.count(distinct h.status) from tj_preview.tj_po_headers h where h.id = any (v_sources)) > 1
-     or (select pg_catalog.min(h.status) from tj_preview.tj_po_headers h where h.id = any (v_sources)) <> 'confirmed' then
-    perform tj_preview.tj_gr_fail('GR_STATE', '来源 PO 必须全部是 confirmed 状态');
+
+  -- 来源必须 standard / confirmed / 未冻结；frozen=true 是合同旧笔误，明确拒绝
+  if exists (
+    select 1 from tj_preview.tj_po_headers h
+    where h.id = any (v_sources)
+      and (h.po_type is distinct from 'standard' or h.status <> 'confirmed' or h.frozen)
+  ) then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      '来源 PO 必须全部是 standard + confirmed + frozen=false（冻结/已合并/已推送/草稿一律拒绝）',
+      pg_catalog.jsonb_build_object('source_ids', to_jsonb(v_sources)));
   end if;
   if (select pg_catalog.count(distinct h.supplier_code) from tj_preview.tj_po_headers h where h.id = any (v_sources)) > 1 then
     perform tj_preview.tj_gr_fail('GR_VALIDATION', '合并来源必须同一供应商');
   end if;
-  if (select pg_catalog.count(*) from tj_preview.tj_po_headers h
-       where h.id = any (v_sources) and h.po_type = 'standard') <> v_n then
-    perform tj_preview.tj_gr_fail('GR_STATE', '来源 PO 必须是普通单（standard）');
-  end if;
+
   -- 已被其他合并单占用 → 拒绝
   if exists (
     select 1 from tj_preview.tj_po_headers c
@@ -2435,12 +3243,36 @@ begin
     perform tj_preview.tj_gr_fail('GR_STATE', '来源 PO 已被其他合并单占用');
   end if;
 
+  -- 来源已被收货引用 → 禁止混用（收货余额必须继续挂在原始 standard 行上）
+  if exists (
+    select 1 from tj_preview.tj_gr_line_sources s
+    join tj_preview.tj_po_lines l on l.id = s.po_line_id
+    where l.po_header_id = any (v_sources)
+  ) then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      '来源 PO 已被收货引用：不得并入合并单（需先按原 standard 行收货完成）',
+      pg_catalog.jsonb_build_object('source_ids', to_jsonb(v_sources)));
+  end if;
+
   if (p_data ->> 'website_po_date') is null
      or (p_data ->> 'website_po_date') !~ '^\d{4}-\d{2}-\d{2}$' then
     perform tj_preview.tj_gr_fail('GR_VALIDATION', 'website_po_date 必填 yyyy-MM-dd（不默认当天）',
       pg_catalog.jsonb_build_object('field','website_po_date'));
   end if;
   v_date := (p_data ->> 'website_po_date')::date;
+
+  if pg_catalog.jsonb_typeof(p_data -> 'lines') <> 'array'
+     or pg_catalog.jsonb_array_length(p_data -> 'lines') = 0 then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', '合并单必须有明细行');
+  end if;
+  v_i := 0;  -- 行序号从 0 起（不继承上面的来源计数）
+
+  -- 期望覆盖：来源单全部明细行都要被引用一次
+  select pg_catalog.count(*) into v_expected_lines
+  from tj_preview.tj_po_lines l where l.po_header_id = any (v_sources);
+  if v_expected_lines = 0 then
+    perform tj_preview.tj_gr_fail('GR_VALIDATION', '来源 PO 没有明细行，不能合并');
+  end if;
 
   v_id := gen_random_uuid();
   insert into tj_preview.tj_po_headers
@@ -2449,20 +3281,19 @@ begin
   values (
     v_id, v_supplier,
     (select h.supplier_name from tj_preview.tj_po_headers h where h.id = v_sources[1]),
-    'draft', 'combined', (select pg_catalog.array_agg(h.po_id) from tj_preview.tj_po_headers h where h.id = any (v_sources)),
+    'draft', 'combined',
+    (select pg_catalog.array_agg(h.po_id order by h.po_id) from tj_preview.tj_po_headers h where h.id = any (v_sources)),
     v_date, 1, coalesce(nullif(p_data ->> 'created_by',''), v_uid::text))
   returning po_id into v_po;
-
-  if pg_catalog.jsonb_typeof(p_data -> 'lines') <> 'array'
-     or pg_catalog.jsonb_array_length(p_data -> 'lines') = 0 then
-    perform tj_preview.tj_gr_fail('GR_VALIDATION', '合并单必须有明细行');
-  end if;
 
   for v_line in select value from pg_catalog.jsonb_array_elements(p_data -> 'lines') loop
     v_i := v_i + 1;
     if pg_catalog.jsonb_typeof(v_line -> 'source_refs') <> 'array'
        or pg_catalog.jsonb_array_length(v_line -> 'source_refs') = 0 then
       perform tj_preview.tj_gr_fail('GR_VALIDATION', '合并行必须带 source_refs（来源追溯）');
+    end if;
+    if pg_catalog.jsonb_typeof(v_line -> 'unit_price') is null then
+      perform tj_preview.tj_gr_fail('GR_VALIDATION', '合并行必须带 unit_price');
     end if;
 
     v_ordered := 0;
@@ -2473,45 +3304,55 @@ begin
     for v_ref in
       select value from pg_catalog.jsonb_array_elements(v_line -> 'source_refs')
     loop
-      -- 每个 ref 必须真实属于来源单，且 item/uom/price 与合并行一致
-      declare
-        v_l record;
-        v_qty numeric;
-      begin
-        select l.id, l.po_header_id, l.item_code, l.uom, l.unit_price, h.po_id as po_no
-          into v_l
-        from tj_preview.tj_po_lines l
-        join tj_preview.tj_po_headers h on h.id = l.po_header_id
-        where l.id = (v_ref.value ->> 'line_id')::uuid
-          and l.po_header_id = (v_ref.value ->> 'po_id')::uuid;
+      select l.id, l.po_header_id, l.item_code, l.uom, l.unit_price,
+             coalesce(l.original_qty, l.qty) as ordered, h.po_id as po_no
+        into v_l
+      from tj_preview.tj_po_lines l
+      join tj_preview.tj_po_headers h on h.id = l.po_header_id
+      where l.id = nullif(v_ref.value ->> 'line_id','')::uuid
+        and l.po_header_id = nullif(v_ref.value ->> 'po_id','')::uuid;
 
-        if not found then
-          perform tj_preview.tj_gr_fail('GR_VALIDATION', 'source_refs 指向不存在的来源明细');
-        end if;
-        if not (v_l.po_header_id = any (v_sources)) then
-          perform tj_preview.tj_gr_fail('GR_VALIDATION', 'source_refs 含非来源 PO');
-        end if;
-        if v_l.item_code <> (v_line ->> 'item_code')
-           or coalesce(v_l.uom,'') <> coalesce(v_line ->> 'uom','')
-           or v_l.unit_price <> tj_preview.tj_gr_dec(v_line -> 'unit_price','unit_price') then
-          perform tj_preview.tj_gr_fail('GR_SOURCE_MISMATCH',
-            '合并行的 item/uom/单价与来源明细不一致（不同 UOM/单价必须分行）');
-        end if;
+      if not found then
+        perform tj_preview.tj_gr_fail('GR_VALIDATION', 'source_refs 指向不存在的来源明细');
+      end if;
+      if not (v_l.po_header_id = any (v_sources)) then
+        perform tj_preview.tj_gr_fail('GR_VALIDATION', 'source_refs 含非来源 PO');
+      end if;
+      if v_l.id = any (v_seen_refs) then
+        perform tj_preview.tj_gr_fail('GR_VALIDATION', 'source_refs 重复引用同一来源明细（会放大订购量）',
+          pg_catalog.jsonb_build_object('line_id', v_l.id));
+      end if;
+      v_seen_refs := v_seen_refs || v_l.id;
+      v_total_refs := v_total_refs + 1;
 
-        v_qty := tj_preview.tj_gr_dec(v_ref.value -> 'qty', 'source_refs.qty');
-        v_ordered := v_ordered + v_qty;
-        if v_first_po is null then
-          v_first_po := v_l.po_header_id;
-          v_first_line := v_l.id;
-        end if;
+      if v_l.item_code <> (v_line ->> 'item_code')
+         or coalesce(v_l.uom,'') <> coalesce(v_line ->> 'uom','')
+         or v_l.unit_price <> tj_preview.tj_gr_dec(v_line -> 'unit_price','unit_price') then
+        perform tj_preview.tj_gr_fail('GR_SOURCE_MISMATCH',
+          '合并行的 item/uom/单价与来源明细不一致（不同 UOM/单价必须分行）');
+      end if;
 
-        v_refs := v_refs || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
-          'po_id', v_l.po_header_id,
-          'po_number', v_l.po_no,
-          'line_id', v_l.id,
-          'qty', v_qty
-        ));
-      end;
+      v_qty := tj_preview.tj_gr_dec(v_ref.value -> 'qty', 'source_refs.qty');
+      -- 每个 ref 的数量必须精确等于该来源行的真实原订购量（禁止凭引用放大）
+      if v_qty is distinct from v_l.ordered then
+        perform tj_preview.tj_gr_fail('GR_QTY_MISMATCH',
+          pg_catalog.format('source_refs.qty=%s 与来源原订购量 %s 不一致（不得放大/改写订购量）',
+            tj_preview.tj_gr_dec_text(v_qty), tj_preview.tj_gr_dec_text(v_l.ordered)),
+          pg_catalog.jsonb_build_object('po_line_id', v_l.id));
+      end if;
+
+      v_ordered := v_ordered + v_qty;
+      if v_first_po is null then
+        v_first_po := v_l.po_header_id;
+        v_first_line := v_l.id;
+      end if;
+
+      v_refs := v_refs || pg_catalog.jsonb_build_array(pg_catalog.jsonb_build_object(
+        'po_id', v_l.po_header_id,
+        'po_number', v_l.po_no,
+        'line_id', v_l.id,
+        'qty', v_qty
+      ));
     end loop;
 
     if (v_line ->> 'ordered_qty') is not null
@@ -2519,10 +3360,9 @@ begin
       perform tj_preview.tj_gr_fail('GR_QTY_MISMATCH', '合并行 ordered_qty 与 source_refs 合计不一致');
     end if;
 
+    -- accepted 允许超过订购（前端可先记多收），但必须由独立收货审查处理，
+    -- 这里不静默改成 ordered，也不允许负数。
     v_accepted := coalesce(tj_preview.tj_gr_dec(v_line -> 'accepted_qty','accepted_qty'), v_ordered);
-    if v_accepted > v_ordered then
-      perform tj_preview.tj_gr_fail('GR_QTY_MISMATCH', '合并行 accepted_qty 不能超过订购量');
-    end if;
 
     insert into tj_preview.tj_po_lines
       (po_header_id, line_no, item_code, description, uom, qty, unit_price,
@@ -2538,9 +3378,21 @@ begin
       v_first_po, v_first_line, v_refs, v_ordered, v_accepted, v_line ->> 'note');
   end loop;
 
-  -- 来源单标记 combining（未冻结，允许）
+  -- 覆盖断言：refs 必须恰好覆盖全部来源行一次（不多不少）
+  if v_total_refs <> v_expected_lines then
+    perform tj_preview.tj_gr_fail('GR_QTY_MISMATCH',
+      pg_catalog.format('source_refs 覆盖 %s 条来源行，但来源单共有 %s 条（不得漏行/重复）',
+        v_total_refs, v_expected_lines));
+  end if;
+
+  -- 来源单标记 combining（未冻结，允许）；更新行数必须等于来源数
   update tj_preview.tj_po_headers set status = 'combining', updated_at = now()
    where id = any (v_sources) and status = 'confirmed' and frozen = false;
+  get diagnostics v_updated = row_count;
+  if v_updated <> v_n then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      pg_catalog.format('来源 PO 标记 combining 的行数 %s 与来源数 %s 不一致', v_updated, v_n));
+  end if;
 
   v_result := pg_catalog.jsonb_build_object('id', v_id, 'po_id', v_po, 'status', 'draft',
     'source_ids', to_jsonb(v_sources));
@@ -2571,7 +3423,15 @@ begin
   if not found then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '合并单不存在');
   end if;
-  if h.po_type <> 'combined' or h.status <> 'draft' or h.frozen then
+  if h.po_type <> 'combined' then
+    perform tj_preview.tj_gr_fail('GR_STATE', '不是合并单');
+  end if;
+
+  -- 幂等：已提交直接返回现有单（不重复写、不伪造收货字段）
+  if h.status = 'pending_approval' and not h.frozen then
+    return tj_preview.tj_gr_po_json(v_id);
+  end if;
+  if h.status <> 'draft' or h.frozen then
     perform tj_preview.tj_gr_fail('GR_STATE', pg_catalog.format('合并单当前状态 %s 不能提交审批', h.status),
       pg_catalog.jsonb_build_object('status', h.status));
   end if;
@@ -2579,17 +3439,17 @@ begin
     perform tj_preview.tj_gr_fail('GR_VALIDATION', '缺少 Website PO Date，不能提交审批（不默认当天）');
   end if;
 
+  -- 只推进状态与人工核对字段；**不**制造 receipt_event_id / received_at
   update tj_preview.tj_po_headers set
     status = 'pending_approval',
-    checked_by = coalesce(p_data ->> 'checked_by', checked_by),
-    delivery_order_no = coalesce(p_data ->> 'delivery_order_no', delivery_order_no),
-    receipt_event_id = coalesce(receipt_event_id, gen_random_uuid()::text),
-    received_at = coalesce(received_at, now()),
+    checked_by = coalesce(nullif(p_data ->> 'checked_by',''), checked_by),
+    delivery_order_no = coalesce(nullif(p_data ->> 'delivery_order_no',''), delivery_order_no),
     updated_at = now()
   where id = v_id;
 
   insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
-  values (v_uid, 'combine_submit', 'po_header', v_id::text, '{}'::jsonb);
+  values (v_uid, 'combine_submit', 'po_header', v_id::text,
+          pg_catalog.jsonb_build_object('receipt_event_id_untouched', true));
 
   return tj_preview.tj_gr_po_json(v_id);
 end
@@ -2607,6 +3467,8 @@ declare
   h tj_preview.tj_po_headers%rowtype;
   v_hash text;
   v_src text;
+  v_updated int := 0;
+  v_one int;
 begin
   v_uid := tj_preview.tj_gr_require_role(array['approver']);
 
@@ -2614,7 +3476,15 @@ begin
   if not found then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '合并单不存在');
   end if;
-  if h.po_type <> 'combined' or h.status <> 'pending_approval' or h.frozen then
+  if h.po_type <> 'combined' then
+    perform tj_preview.tj_gr_fail('GR_STATE', '不是合并单');
+  end if;
+
+  -- 幂等：已批准冻结直接返回（不改 hash / approved_at）
+  if h.status = 'confirmed' and h.frozen then
+    return tj_preview.tj_gr_po_json(v_id);
+  end if;
+  if h.status <> 'pending_approval' or h.frozen then
     perform tj_preview.tj_gr_fail('GR_STATE', pg_catalog.format('合并单当前状态 %s 不能批准', h.status),
       pg_catalog.jsonb_build_object('status', h.status));
   end if;
@@ -2624,6 +3494,11 @@ begin
   if not exists (select 1 from tj_preview.tj_po_lines l where l.po_header_id = v_id) then
     perform tj_preview.tj_gr_fail('GR_VALIDATION', '合并单没有明细，不能批准');
   end if;
+
+  -- 锁来源单（顺序一致），并确认仍可被合并（未冻结、仍 combining）
+  perform 1 from tj_preview.tj_po_headers h2
+   where h2.po_id = any (coalesce(h.source_po_ids, '{}'::text[]))
+   order by h2.id for update;
 
   v_hash := tj_preview.tj_gr_sha256(tj_preview.tj_gr_approval_canonical(v_id));
 
@@ -2637,10 +3512,18 @@ begin
     updated_at = now()
   where id = v_id;
 
-  foreach v_src in array h.source_po_ids loop
+  foreach v_src in array coalesce(h.source_po_ids, '{}'::text[]) loop
     update tj_preview.tj_po_headers set status = 'combined', updated_at = now()
-     where po_id = v_src and frozen = false;
+     where po_id = v_src and status = 'combining' and frozen = false;
+    get diagnostics v_one = row_count;
+    v_updated := v_updated + v_one;
   end loop;
+
+  if v_updated <> coalesce(pg_catalog.array_length(h.source_po_ids, 1), 0) then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      pg_catalog.format('来源单标记 combined 的行数 %s 与来源数 %s 不一致', v_updated,
+        coalesce(pg_catalog.array_length(h.source_po_ids, 1), 0)));
+  end if;
 
   insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
   values (v_uid, 'combine_approve', 'po_header', v_id::text,
@@ -2661,6 +3544,8 @@ declare
   v_id uuid := (p_data ->> 'id')::uuid;
   h tj_preview.tj_po_headers%rowtype;
   v_src text;
+  v_updated int := 0;
+  v_one int;
 begin
   v_uid := tj_preview.tj_gr_require_role(array['staff','approver']);
 
@@ -2668,16 +3553,37 @@ begin
   if not found then
     perform tj_preview.tj_gr_fail('GR_NOT_FOUND', '合并单不存在');
   end if;
-  if h.po_type <> 'combined' or h.status not in ('draft','pending_approval') or h.frozen then
-    perform tj_preview.tj_gr_fail('GR_STATE', pg_catalog.jsonb_build_object('status', h.status)::text);
+  if h.po_type <> 'combined' then
+    perform tj_preview.tj_gr_fail('GR_STATE', '不是合并单');
   end if;
+
+  -- 幂等：已取消直接返回
+  if h.status = 'cancelled' then
+    return tj_preview.tj_gr_po_json(v_id);
+  end if;
+  if h.status not in ('draft','pending_approval') or h.frozen then
+    perform tj_preview.tj_gr_fail('GR_STATE', pg_catalog.format('合并单当前状态 %s 不能取消', h.status),
+      pg_catalog.jsonb_build_object('status', h.status));
+  end if;
+
+  perform 1 from tj_preview.tj_po_headers h2
+   where h2.po_id = any (coalesce(h.source_po_ids, '{}'::text[]))
+   order by h2.id for update;
 
   update tj_preview.tj_po_headers set status = 'cancelled', updated_at = now() where id = v_id;
 
   foreach v_src in array coalesce(h.source_po_ids, '{}'::text[]) loop
     update tj_preview.tj_po_headers set status = 'confirmed', updated_at = now()
      where po_id = v_src and status = 'combining' and frozen = false;
+    get diagnostics v_one = row_count;
+    v_updated := v_updated + v_one;
   end loop;
+
+  if v_updated <> coalesce(pg_catalog.array_length(h.source_po_ids, 1), 0) then
+    perform tj_preview.tj_gr_fail('GR_STATE',
+      pg_catalog.format('来源单恢复 confirmed 的行数 %s 与来源数 %s 不一致', v_updated,
+        coalesce(pg_catalog.array_length(h.source_po_ids, 1), 0)));
+  end if;
 
   insert into tj_preview.tj_gr_audit(actor, action, entity, entity_id, detail)
   values (v_uid, 'combine_cancel', 'po_header', v_id::text, '{}'::jsonb);
@@ -2698,6 +3604,8 @@ as $fn$
 declare
   v_result jsonb;
   v_uid uuid := auth.uid();
+  v_roles text[];
+  v_is_member boolean;
 begin
   if v_uid is null then
     perform tj_preview.tj_gr_fail('GR_AUTH_REQUIRED', '需要真实登录用户（auth.uid() 为空）');
@@ -2706,8 +3614,11 @@ begin
     perform tj_preview.tj_gr_fail('GR_VALIDATION', 'p_action 必填');
   end if;
 
+  v_roles := tj_preview.tj_gr_roles();
+  v_is_member := tj_preview.tj_gr_is_member();
+
   -- 读动作也必须 membership（definer 会绕过 RLS，不能只靠表策略）
-  if p_action in ('receipt_list', 'receipt_get') then
+  if p_action in ('receipt_list', 'receipt_get', 'po_get') then
     perform tj_preview.tj_gr_require_role(array['staff', 'approver', 'executor']);
   end if;
 
@@ -2715,9 +3626,28 @@ begin
     when 'session' then
       v_result := pg_catalog.jsonb_build_object(
         'user_id', v_uid,
-        'roles', to_jsonb(tj_preview.tj_gr_roles()),
-        'is_admin', ('admin' = any (tj_preview.tj_gr_roles())),
-        'active', tj_preview.tj_gr_is_member()
+        'roles', to_jsonb(v_roles),
+        'is_admin', ('admin' = any (v_roles)),
+        'active', v_is_member,
+        -- 实际可用动作（按真实角色计算；不依赖 UI 声明）
+        'can', pg_catalog.jsonb_build_object(
+          'receipt_list', v_is_member,
+          'receipt_get', v_is_member,
+          'receipt_save', (v_roles && array['staff','approver']),
+          'receipt_submit', (v_roles && array['staff','approver']),
+          'receipt_approve', (v_roles && array['approver']),
+          'receipt_release', (v_roles && array['approver']),
+          'mapping_set', (v_roles && array['approver']),
+          'task_claim', (v_roles && array['executor']),
+          'task_result', (v_roles && array['executor']),
+          'po_get', v_is_member,
+          'po_save', (v_roles && array['staff','approver']),
+          'po_push', (v_roles && array['staff','approver']),
+          'combine_create', (v_roles && array['staff','approver']),
+          'combine_submit', (v_roles && array['staff','approver']),
+          'combine_approve', (v_roles && array['approver']),
+          'combine_cancel', (v_roles && array['staff','approver'])
+        )
       );
     when 'receipt_list' then
       v_result := tj_preview.tj_gr_receipt_list(p_data);
@@ -2740,6 +3670,15 @@ begin
       v_result := tj_preview.tj_gr_task_result(p_data);
     when 'mapping_set' then
       v_result := tj_preview.tj_gr_mapping_set(p_data);
+    when 'po_get' then
+      if (p_data ->> 'id') is null or nullif(p_data ->> 'id','')::uuid is null then
+        perform tj_preview.tj_gr_fail('GR_VALIDATION', 'po_get 需要 id');
+      end if;
+      v_result := tj_preview.tj_gr_po_json((p_data ->> 'id')::uuid);
+      if v_result is null then
+        perform tj_preview.tj_gr_fail('GR_NOT_FOUND', 'PO 不存在',
+          pg_catalog.jsonb_build_object('id', p_data ->> 'id'));
+      end if;
     when 'po_save' then
       v_result := tj_preview.tj_gr_po_save(p_data);
     when 'po_push' then
@@ -2838,7 +3777,7 @@ begin
 end
 $policies$;
 
--- 权限：anon 完全无权；authenticated 只读；写只能经 definer RPC
+-- 权限：anon 完全无权；authenticated 只读新表；写只能经 definer RPC
 do $grants$
 declare
   t text;
@@ -2858,45 +3797,113 @@ end
 $grants$;
 
 grant usage on schema tj_preview to authenticated;
-grant execute on function tj_preview.tj_gr_is_member() to authenticated;
-grant execute on function tj_preview.tj_gr_roles() to authenticated;
-grant execute on function tj_preview.tj_gr_api(text, jsonb) to authenticated;
 
-revoke all on function tj_preview.tj_gr_api(text, jsonb) from public;
-revoke all on function tj_preview.tj_gr_api(text, jsonb) from anon;
-revoke all on function tj_preview.tj_gr_is_member() from public, anon;
-revoke all on function tj_preview.tj_gr_roles() from public, anon;
+-- B1/B4/B9 数据完整性 + 权限收敛（预览库）。
 
--- service_role 可能在某些环境不存在（本地 harness）→ 有则撤，无则跳过
-do $revoke_sr$
+-- 2) 来源关系必须是真 FK + ON DELETE RESTRICT（来源不允许消失）
+do $fks$
 begin
-  if exists (select 1 from pg_catalog.pg_roles r where r.rolname = 'service_role') then
-    execute 'revoke all on function tj_preview.tj_gr_api(text, jsonb) from service_role';
-    execute 'revoke all on function tj_preview.tj_gr_is_member() from service_role';
-    execute 'revoke all on function tj_preview.tj_gr_roles() from service_role';
+  if not exists (
+    select 1 from pg_catalog.pg_constraint c
+    join pg_catalog.pg_class r on r.oid = c.conrelid
+    join pg_catalog.pg_namespace n on n.oid = r.relnamespace
+    where n.nspname = 'tj_preview' and r.relname = 'tj_gr_line_sources'
+      and c.conname = 'fk_tj_gr_sources_po_header'
+  ) then
+    alter table tj_preview.tj_gr_line_sources
+      add constraint fk_tj_gr_sources_po_header
+      foreign key (po_header_id) references tj_preview.tj_po_headers (id) on delete restrict;
+  end if;
+
+  if not exists (
+    select 1 from pg_catalog.pg_constraint c
+    join pg_catalog.pg_class r on r.oid = c.conrelid
+    join pg_catalog.pg_namespace n on n.oid = r.relnamespace
+    where n.nspname = 'tj_preview' and r.relname = 'tj_gr_line_sources'
+      and c.conname = 'fk_tj_gr_sources_po_line'
+  ) then
+    alter table tj_preview.tj_gr_line_sources
+      add constraint fk_tj_gr_sources_po_line
+      foreign key (po_line_id) references tj_preview.tj_po_lines (id) on delete restrict;
+  end if;
+
+  if not exists (
+    select 1 from pg_catalog.pg_constraint c
+    join pg_catalog.pg_class r on r.oid = c.conrelid
+    join pg_catalog.pg_namespace n on n.oid = r.relnamespace
+    where n.nspname = 'tj_preview' and r.relname = 'tj_gr_po_mappings'
+      and c.conname = 'fk_tj_gr_mappings_po_header'
+  ) then
+    alter table tj_preview.tj_gr_po_mappings
+      add constraint fk_tj_gr_mappings_po_header
+      foreign key (po_header_id) references tj_preview.tj_po_headers (id) on delete restrict;
+  end if;
+
+  if not exists (
+    select 1 from pg_catalog.pg_constraint c
+    join pg_catalog.pg_class r on r.oid = c.conrelid
+    join pg_catalog.pg_namespace n on n.oid = r.relnamespace
+    where n.nspname = 'tj_preview' and r.relname = 'tj_gr_tasks'
+      and c.conname = 'fk_tj_gr_tasks_po_header'
+  ) then
+    alter table tj_preview.tj_gr_tasks
+      add constraint fk_tj_gr_tasks_po_header
+      foreign key (po_header_id) references tj_preview.tj_po_headers (id) on delete restrict;
   end if;
 end
-$revoke_sr$;
+$fks$;
 
--- service_role 不得拥有 tj_preview USAGE（保持生产推送器天然隔离）
-do $sr$
+-- 3) B1：所有 tj_gr_* 函数默认拒绝 PUBLIC/anon/authenticated（内部 helper 连
+--    service_role 也拒绝）直接执行；只有 tj_gr_api / tj_gr_is_member / tj_gr_roles
+--    三个入口 grant 给 authenticated。内部 helper 只能由 definer owner 内部调用。
+do $fnpriv$
+declare
+  r record;
+  v_has_service_role boolean := exists (select 1 from pg_catalog.pg_roles where rolname = 'service_role');
 begin
-  if exists (select 1 from pg_catalog.pg_roles r where r.rolname = 'service_role') then
-    execute 'revoke all on schema tj_preview from service_role';
-    execute 'revoke all on all tables in schema tj_preview from service_role';
-    execute 'revoke all on all functions in schema tj_preview from service_role';
-    execute 'revoke all on all sequences in schema tj_preview from service_role';
-  end if;
-end
-$sr$;
+  for r in
+    select p.oid::regprocedure as sig, p.proname as name
+    from pg_catalog.pg_proc p
+    join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'tj_preview'
+      and p.proname like 'tj_gr\_%'
+  loop
+    execute pg_catalog.format('revoke all on function %s from public', r.sig);
+    execute pg_catalog.format('revoke all on function %s from anon', r.sig);
+    execute pg_catalog.format('revoke all on function %s from authenticated', r.sig);
+    if v_has_service_role and r.name not in ('tj_gr_api', 'tj_gr_is_member', 'tj_gr_roles') then
+      execute pg_catalog.format('revoke all on function %s from service_role', r.sig);
+    end if;
+  end loop;
 
+  execute 'grant execute on function tj_preview.tj_gr_api(text, jsonb) to authenticated';
+  execute 'grant execute on function tj_preview.tj_gr_is_member() to authenticated';
+  execute 'grant execute on function tj_preview.tj_gr_roles() to authenticated';
+
+  -- 硬校验：任何内部 helper 都不得被 authenticated 直接执行（防止漏 revoke）
+  for r in
+    select p.oid::regprocedure as sig
+    from pg_catalog.pg_proc p
+    join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'tj_preview'
+      and p.proname like 'tj_gr\_%'
+      and p.proname not in ('tj_gr_api', 'tj_gr_is_member', 'tj_gr_roles')
+  loop
+    if pg_catalog.has_function_privilege('authenticated', r.sig, 'EXECUTE') then
+      raise exception 'helper % 仍可被 authenticated 直接执行（B1 未闭合）', r.sig;
+    end if;
+  end loop;
+end
+$fnpriv$;
+
+-- 4) B4：预览旧 6 表撤 anon 全部写（含 truncate/references/trigger + sequence），
+--    删除旧 anon ALL 策略，只保留 membership 只读策略。既有 freeze guards 不动。
 -- >>> PREVIEW_ONLY_LEGACY_HARDENING_BEGIN
--- 预览库旧 6 表：authenticated 目前有 ALL grants 但只有 anon 的 ALL 策略。
--- 这里只收敛 authenticated（anon 仍按预览现状，便于现有 preview 页面回归）：
---   读 → membership 策略；写 → 撤销，全部走 RPC。
 do $legacy$
 declare
   t text;
+  r record;
+  v_seq record;
 begin
   foreach t in array array[
     'tj_po_headers','tj_po_lines','tj_po_exports','tj_item_requests','tj_suppliers','tj_items'
@@ -2907,36 +3914,58 @@ begin
       where n.nspname = 'tj_preview' and c.relname = t
     ) then
       execute pg_catalog.format('alter table tj_preview.%I enable row level security', t);
-      execute pg_catalog.format('revoke insert, update, delete, truncate, references, trigger on tj_preview.%I from authenticated', t);
+
+      -- anon 与 authenticated 都不得直写；旧 anon ALL 策略一并删除
+      execute pg_catalog.format(
+        'revoke insert, update, delete, truncate, references, trigger on tj_preview.%I from anon, authenticated', t);
+      execute pg_catalog.format('revoke all on tj_preview.%I from anon', t);
       execute pg_catalog.format('grant select on tj_preview.%I to authenticated', t);
-      execute pg_catalog.format('drop policy if exists gr_member_read on tj_preview.%I', t);
+
+      for r in
+        select policyname from pg_catalog.pg_policies
+        where schemaname = 'tj_preview' and tablename = t
+      loop
+        execute pg_catalog.format('drop policy %I on tj_preview.%I', r.policyname, t);
+      end loop;
       execute pg_catalog.format(
         'create policy gr_member_read on tj_preview.%I for select to authenticated using (tj_preview.tj_gr_is_member())', t);
     end if;
+  end loop;
+
+  -- 旧 6 表相关序列统一撤 anon/authenticated（写只走 definer RPC）
+  for v_seq in
+    select c.oid::regclass::text as sig
+    from pg_catalog.pg_class c
+    join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'tj_preview' and c.relkind = 'S'
+      and (c.relname like 'tj_po\_%' or c.relname like 'tj_item\_%'
+           or c.relname like 'tj_suppliers\_%' or c.relname like 'tj_gr\_%')
+  loop
+    execute pg_catalog.format('revoke all on sequence %s from anon, authenticated', v_seq.sig);
   end loop;
 end
 $legacy$;
 -- <<< PREVIEW_ONLY_LEGACY_HARDENING_END
 
--- ----------------------------------------------------------------------------
--- 13) 读回校验（应用后手工执行或由集成测试覆盖）
--- ----------------------------------------------------------------------------
--- select count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace
---  where n.nspname = 'tj_preview' and c.relname like 'tj_gr_%';
--- select has_schema_privilege('service_role', 'tj_preview', 'USAGE');       -- 预览库必须 false
--- select has_function_privilege('anon', 'tj_preview.tj_gr_api(text,jsonb)', 'EXECUTE');  -- 必须 false
--- select has_table_privilege('authenticated', 'tj_preview.tj_gr_receipt_events', 'INSERT'); -- 必须 false
--- select proname, prosecdef, proconfig from pg_catalog.pg_proc p
---  join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'tj_preview' and p.prosecdef;
+-- 5) 预览库：service_role 不得拥有 tj_preview 的 USAGE（public 版不包含本块）
+-- >>> PREVIEW_ONLY_SERVICE_ROLE_LOCKOUT_BEGIN
+do $sr$
+begin
+  if exists (select 1 from pg_catalog.pg_roles r where r.rolname = 'service_role') then
+    execute 'revoke all on schema tj_preview from service_role';
+    execute 'revoke all on all tables in schema tj_preview from service_role';
+    execute 'revoke all on all functions in schema tj_preview from service_role';
+    execute 'revoke all on all sequences in schema tj_preview from service_role';
+  end if;
+end
+$sr$;
+-- <<< PREVIEW_ONLY_SERVICE_ROLE_LOCKOUT_END
 
--- ----------------------------------------------------------------------------
--- 14) 回滚（只撤本轮新对象；不 DROP 旧表/列/索引/guard）
--- ----------------------------------------------------------------------------
--- drop function if exists tj_preview.tj_gr_api(text, jsonb);
--- drop function if exists tj_preview.tj_gr_receipt_list(jsonb);
--- ... 其余 tj_gr_* 函数逐个 drop（见文件内 create or replace 清单）
--- drop table if exists tj_preview.tj_gr_audit, tj_preview.tj_gr_requests,
---   tj_preview.tj_gr_outbox, tj_preview.tj_gr_task_callbacks, tj_preview.tj_gr_tasks,
---   tj_preview.tj_gr_po_mappings, tj_preview.tj_gr_line_sources,
---   tj_preview.tj_gr_receipt_lines, tj_preview.tj_gr_receipt_events, tj_preview.tj_gr_memberships;
--- 注意：回滚前先确认没有已 approved/verified 的收货证据需要保留；不要 DROP SCHEMA CASCADE。
+-- 6) 读回（应用后手工执行或由集成测试覆盖）
+-- select count(*) from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid=p.pronamespace
+--  where n.nspname='tj_preview' and p.proname like 'tj_gr\_%'
+--    and pg_catalog.has_function_privilege('authenticated', p.oid, 'EXECUTE');  -- 期望 3
+-- select has_schema_privilege('service_role', 'tj_preview', 'USAGE');           -- 期望 false
+-- select has_function_privilege('anon', 'tj_preview.tj_gr_api(text,jsonb)', 'EXECUTE'); -- 期望 false
+-- select has_table_privilege('anon', 'tj_preview.tj_po_headers', 'INSERT');    -- 期望 false
+-- select has_table_privilege('authenticated', 'tj_preview.tj_gr_receipt_events', 'INSERT'); -- 期望 false
