@@ -1,7 +1,7 @@
 # Stage25 Preview 最终修复与 Windows 交付
 
 接续锚点
-仅处理新单 PO-000028；先核对本交接状态，禁止重复投递、重跑旧单 IRS 保存或发送 PO-000026 标准 ACK。当前网页版本未发布，Windows V2 未在目标机执行，完整闭环未验收。
+仅处理新单 PO-000028；先核对本交接状态，禁止重复投递、重跑旧单 IRS 保存或发送 PO-000026 标准 ACK。当前网页版本未发布；用户随后报告Windows V2已安装、离线SelfTest通过，Configure/Login卡在VPS凭据交接。该阻塞已按实际TJ_字段修复，真实TTY/SHOW保留；需本人重跑SSH后配置登录，不重下V2。本次不发ACK，完整闭环未验收。
 
 ## 目标及完成标准
 目标为新单真实收件、保存回查和标准ACK闭环；完成标准是Windows真实Done/Outbox与数据库accepted/IRS/SHA/event一致。当前仅收件及服务端修复验收，真实保存与ACK待用户执行。

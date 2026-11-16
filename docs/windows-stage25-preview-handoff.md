@@ -31,6 +31,12 @@ V1（`Stage25_PO_ACK_Worker_V1.ps1`）**不再发送、不再使用**；V2 使�
 
 取得方式：在 Windows 打开 PowerShell，通过既有 SSH 隧道在**自己的终端**运行（`-t` 保证交互 TTY）：
 
+VPS 交接脚本已兼容私有配置中的 `TJ_SUPABASE_URL`、`TJ_SUPABASE_ANON_KEY`、
+`TJ_ACK_SCHEMA`、`TJ_ACK_RPC`、`TJ_ACK_WORKER_EMAIL`、`TJ_ACK_WORKER_PASSWORD`；
+只在内存映射到交互显示名称，schema必须为`tj_preview`，RPC必须为`tj_po_ack_ingest`。
+文件不必包含Windows路径，缺少`QUEUE_ROOT`时使用本文已确认默认路径。
+仅修改VPS脚本，Windows V2脚本/认证逻辑未改，已安装V2无需重新下载。
+
 ```
 ssh -t -i "$env:USERPROFILE\.ssh\hermes-xeon" hermes@167.104.103.163 "python3 /home/hermes/worktrees/TJ-AI-Ops-stage25-final/scripts/show-preview-connection.py"
 ```

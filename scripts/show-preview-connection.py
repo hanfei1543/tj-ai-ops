@@ -28,6 +28,15 @@ FIELDS = [
     ("QUEUE_ROOT", "Windows Queue 根目录"),
 ]
 CONFIRM_WORD = "SHOW"
+DEFAULT_QUEUE_ROOT = r"C:\Users\Administrator\Desktop\operation\PO_Queue"
+FIELD_ALIASES = {
+    "SUPABASE_URL": "TJ_SUPABASE_URL",
+    "SUPABASE_ANON_KEY": "TJ_SUPABASE_ANON_KEY",
+    "SUPABASE_SCHEMA": "TJ_ACK_SCHEMA",
+    "WORKER_EMAIL": "TJ_ACK_WORKER_EMAIL",
+    "WORKER_PASSWORD": "TJ_ACK_WORKER_PASSWORD",
+    "ACK_RPC": "TJ_ACK_RPC",
+}
 
 
 def refuse(message: str) -> int:
@@ -48,6 +57,27 @@ def parse_env(text: str):
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
             value = value[1:-1]
         values[key] = value
+    return values
+
+
+def resolve_config(source: dict[str, str]) -> dict[str, str]:
+    """Resolve existing names in memory only; errors contain names, never values."""
+    values = dict(source)
+    for canonical, alias in FIELD_ALIASES.items():
+        current, existing = source.get(canonical, ""), source.get(alias, "")
+        if current and existing and current != existing:
+            raise ValueError("凭据字段冲突：%s / %s" % (canonical, alias))
+        values[canonical] = current or existing
+    values["QUEUE_ROOT"] = source.get("QUEUE_ROOT") or DEFAULT_QUEUE_ROOT
+    missing = [key for key, _ in FIELDS if not values.get(key)]
+    if not values.get("ACK_RPC"):
+        missing.append("ACK_RPC")
+    if missing:
+        raise ValueError("凭据文件缺少字段：" + ", ".join(missing))
+    if values["SUPABASE_SCHEMA"] != "tj_preview":
+        raise ValueError("SUPABASE_SCHEMA 必须是 tj_preview（未显示配置值）")
+    if values["ACK_RPC"] != "tj_po_ack_ingest":
+        raise ValueError("ACK_RPC 必须是 tj_po_ack_ingest（未显示配置值）")
     return values
 
 
@@ -73,17 +103,11 @@ def main() -> int:
 
     try:
         with open(ENV_PATH, "r", encoding="utf-8") as fh:
-            values = parse_env(fh.read())
-    except OSError:
+            values = resolve_config(parse_env(fh.read()))
+    except (OSError, UnicodeError):
         return refuse("读取凭据文件失败（未显示任何凭据）")
-
-    missing = [key for key, _ in FIELDS if not values.get(key)]
-    if missing:
-        return refuse("凭据文件缺少字段：" + ", ".join(missing))
-
-    schema = values.get("SUPABASE_SCHEMA", "")
-    if schema != "tj_preview":
-        return refuse("SUPABASE_SCHEMA 必须是 tj_preview（当前为 %r）" % schema)
+    except ValueError as error:
+        return refuse(str(error))
 
     print("")
     print("=== Stage25 Preview V2 连接信息（仅本次终端显示）===")
