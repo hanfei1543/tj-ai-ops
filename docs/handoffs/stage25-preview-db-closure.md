@@ -1,7 +1,7 @@
 # Stage25 Preview 数据库修复包（tj_preview only）
 
 > 分支：`task/stage25-preview-db` · 迁移：`supabase/migrations/20261116_stage25_preview_closure.sql`
-> 状态：**PREPARED**（离线 PGlite 真实 SQL 全部通过）；未应用任何真实数据库、未动 public、未动 SOT。
+> 最终状态：2026-11-16 08:31 UTC 主脑已将最终修订应用到真实 tj_preview 并独立读回，既有manual/intents/evidence/receipts未变。主脑回归353/353、Preview build通过；新时序拒绝仅写audit、legacy来源锁和NULL行拒绝已生效。Windows V2及真实新单ACK尚未执行，托管网页未发布本轮版本。完整当前状态见 `stage25-preview-final.md`；下文应用步骤是维护参考，不应再次运行旧ACK v1覆盖wrapper。
 
 ## 1. 这个包解决什么
 

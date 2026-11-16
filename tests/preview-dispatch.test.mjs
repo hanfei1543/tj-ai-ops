@@ -258,7 +258,7 @@ test('成功路径：8 列 PAD 口径 + 永久原件 + 两级证据 + 同一次�
     ['list', 'list', 'list', 'list', 'list', 'write', 'read'],
   )
   assert.deepEqual(
-    bridge.calls.filter((c) => c.list).map((c) => c.list.dir),
+    bridge.calls.filter((c) => c.list).map((c) => c.list),
     ['Pending', 'Processing', 'Done', 'Failed', 'NeedsReview'].map((d) => windowsPathJoinDir(QUEUE_ROOT, d)),
   )
 
@@ -337,7 +337,7 @@ test('Pending 已有同名文件 → 拒绝覆写并 uncertain（bridge 只 list
   const { db, bridge, run } = build({ bridge: { entries: [`${HDR.po_id}.xlsx`] } })
   await assert.rejects(run(), (e) => e.uncertain === true && e.code === 'TARGET_EXISTS')
   assert.equal(bridge.calls.length, 1)
-  assert.equal(bridge.calls[0].list.dir, TARGET_DIR)
+  assert.equal(bridge.calls[0].list, TARGET_DIR)
   assert.equal(bridge.writes().length, 0)
   assert.equal(db.state.intent.state, REQUEST_STATES.DELIVERY_UNCERTAIN)
   assert.equal(db.state.evidence.some((e) => e.stage === EVIDENCE_STAGES.WINDOWS_RECEIVED), false)
@@ -351,8 +351,8 @@ test('同 PO 文件已出现在 Done/Processing → 拒绝（防把已处理单�
     const seen = []
     const scoped = async (payload) => {
       if (payload.list) {
-        seen.push(payload.list.dir)
-        const hit = payload.list.dir.endsWith('\\' + dir)
+        seen.push(payload.list)
+        const hit = payload.list.endsWith('\\' + dir)
         return { ok: true, entries: hit ? [`${HDR.po_id}.xlsx`] : [] }
       }
       return original(payload)

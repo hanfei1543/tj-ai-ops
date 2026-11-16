@@ -795,7 +795,7 @@ begin
 end
 $d5$;
 
--- D5b 收件证据齐备但意图未 delivered → 委派 v1 主体按既有语义拒绝
+-- D5b 收件证据齐备但意图未 delivered → 时序型延迟：只审计，不落 receipt 墓碑
 do $d5b$
 declare
   v_res jsonb;
@@ -810,7 +810,13 @@ begin
     pg_temp.tj_rpc_json('authenticated', '66666666-6666-4666-8666-666666666666',
       'tj_preview.tj_po_ack_ingest',
       pg_temp.tj_ack_payload('PO-910113', 'PO99000114', (select val from _fx where name = 'sha_ack_new'))),
-    'PO_ACK_NO_PUSH_DELIVERY', 'D-delegate', '未 delivered 的意图由 v1 主体拒绝（不伪造成功）');
+    'PO_ACK_NO_PUSH_DELIVERY', 'D-delegate', '未 delivered 的意图被拒绝（不伪造成功）');
+
+  perform pg_temp.tj_assert((v_res ->> 'retryable')::boolean, 'D-delegate',
+    '未 delivered 是时序型拒绝：retryable=true');
+  perform pg_temp.tj_assert(
+    (select count(*) from tj_preview.tj_po_ack_receipts where po_id = 'PO-910113') = 0,
+    'D-delegate', '时序型拒绝不落唯一 receipt 墓碑（证据到齐后同一 event 可 accepted）');
 
   perform pg_temp.tj_assert(
     (select erp_status from tj_preview.tj_po_headers where po_id = 'PO-910113') = 'none',

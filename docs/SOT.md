@@ -3,15 +3,17 @@
 > 最后归档: 2026-11-13 员工界面中文化 + 投递恢复只读原型
 
 ## 1 当前焦点与下一步
-- **接续锚点**：进入 /home/hermes/worktrees/TJ-AI-Ops-integration（integration/po-date-gr-v2，HEAD 66c246e），先读 docs/handoffs/NEW_CHAT_START_HERE.md；下一项需单独授权的真实 tj_preview 应用 + Preview 构建发布，不从头审计。
-- **当前焦点**：员工界面中文化 + PO Push 人工恢复只读原型 + Preview 验收准备文档已完成并提交；本轮新增 Goods Receive Date 业务规则审计（结论：收货日期已正确实现、与 PO/Invoice/DO/系统时间严格区分、进 hash/快照/任务/回调，无需修复，缺口为 DO 日期字段/作废 RPC/未来日期护栏）。npm test 269/269、tsc + vite build 通过。
-- **下一步**：① 单独授权后真实应用 20261113_gr_unified_preview.sql + 20261114_gr_po_save_website_date.sql 到 tj_preview（读回验证）② 发布指向 tj_preview 的 Preview 前端构建并取得 URL ③ 采购员/收货员工/审批人三角色浏览器交互验收 ④ public 旧表权限收紧另行授权。
-- **已排除/勿重试**：不 push、不 merge 正式分支、不真实 migration、不部署生产、不接生产 Bridge/Queue/PAD/IRS、不调真实 task_claim/task_result；不在隔离 worktree 做真实库查询；不伪造 UI 截图（需真实登录）；不重跑 Windows Stage16/18 离线测试。
-- **对外简报**：员工界面改中文、收货日期业务规则已核对无误、投递恢复只读工具已做好；Preview 验收环境还没建起来，等你授权应用数据库和发布预览站。
+- **接续锚点**：先读 docs/handoffs/stage25-preview-final.md；仅新单PO-000028等待Windows操作，不重投、不发送PO-000026标准ACK。
+- **当前焦点**：Stage25最终代码主脑回归353/353及Preview build通过，closure最终修正在tj_preview真实应用并查回，现有台账/证据未变。PO-000026独立人工历史核验生效；PO-000028已真实Windows Pending收件，6855字节与服务器原件逐字节一致；完整IRS保存/Done/ACK仍未发生。
+- **下一步**：① 交付无密钥Windows V2包及操作说明 ② 用户Windows SelfTest/Configure/Login，再按既有流程完成新单IRS保存回查和Stage23 ③ 实际新单ACK后执行只读SQL核对IRS/SHA/event/accepted及受控幂等。网页发布需明确授权，本次不自动push/部署。
+- **已排除/勿重试**：不重投25/26/28、不改历史SHA/Done/Ledger/Outbox、不重做IRS保存、不碰public/main/生产调度/序列；不把本地回归或API验证说成网页点击或真实WindowsACK完成。legacy人工差异核验保留双摘要，bridge新单只能标准ACK。
+- **对外简报**：修复与数据库读回完成，旧单已独立核验、新单已到电脑且文件一致；还需电脑实际保存、核对并发送新单回执，网页尚未发布本轮版本。
 
 ## 2 交接上下文
-- REQUIRED: docs/handoffs/NEW_CHAT_START_HERE.md（本轮最新接续入口，含 Goods Receive Date 审计 + Preview 状态 + migration 顺序 + 分类清单）。
-- 历史：docs/handoffs/po-date-gr-integration.md、docs/handoffs/preview-acceptance-prep.md、docs/ui-simplification.md、docs/handoffs/combined-po-prelaunch.md；旧 IRS POS docs/handoffs/stock-setup.md，均不扩大批准边界。
+- REQUIRED: docs/handoffs/stage25-preview-final.md
+- Windows操作：docs/windows-stage25-preview-handoff.md；只读回查：docs/evidence/stage25-preview-final-readback.sql。旧GR/中文化历史入口保留于docs/handoffs/NEW_CHAT_START_HERE.md，不启动其它队列。
 
 ## 3 未归档缓冲池
-- [PROGRESS] Goods Receive Date 业务规则审计（六问，确认已正确实现 + 缺口 DO 日期字段/作废 RPC/未来日期护栏）+ NEW_CHAT_START_HERE 接续检查点落盘。
+- [PROGRESS] Goods Receive Date业务规则审计及旧接续检查点已落盘；旧阶段结论以实际实现与本次交接边界为准。
+- [PROGRESS] Stage25整合推送器、网站受控状态RPC、8列日期XLSX、Windows V2；主脑独立复核真实桥协议与两级证据。最终补齐时序拒绝只写审计、legacy来源锁、NULL单价拒绝、manual bridge禁入和权限撤销；353/353回归和Preview build通过，142条真实SQL断言通过。最终closure SHA256=9cd8ada054e8b0d9630605abe1e1e5b4604e10a84df4ed729b4520123e0ae2a7已真实应用tj_preview并读回。
+- [PROGRESS] PO-000026人工对账id=a4e6434b-80c8-444b-8752-e529bc01f70a，IRS=PO26000784，分类manual_delivery_historical_import，旧证据保留；PO-000028真实收件SHA256=2d8f5d3d7be40803233989b65e24377b5fd1d1c63bcd0441ed2df8910f0f68ca，禁止重新投递。新单尚无IRS/Done/ACK，不称全链路完成。私有证据路径在交接单。

@@ -302,6 +302,7 @@ with ev as (
          filename = ${sqlLiteral(filename)},
          updated_at = now()
    where i.id = ${iid} and i.state = '${REQUEST_STATES.DISPATCH_STARTED}'
+     and exists (select 1 from evc)
   returning i.id, i.state
 ), r as (
   update ${PREVIEW_SCHEMA}.${REQUEST_TABLE} q
@@ -606,7 +607,7 @@ export async function runPreviewDispatch({
     const dir = windowsPathJoinDir(QUEUE_ROOT, sub)
     let listing
     try {
-      listing = await bridge({ list: { dir } })
+      listing = await bridge({ list: dir })
     } catch (e) {
       await markUncertain(dbQuery, {
         requestId: rid,

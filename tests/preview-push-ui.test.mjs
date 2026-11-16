@@ -72,7 +72,7 @@ test('tjPoApi：预览 requestPush 走 RPC，不再写 pending_push；生产分�
   assert.match(api, /status: 'pending_push'/)
   // 预览读回
   assert.match(api, /export async function listPreviewPushRequests\(\)/)
-  assert.match(api, /from\('tj_po_preview_push_requests'\)/)
+  assert.match(api, /rpc\('tj_po_preview_list_push_requests'\)/)
 })
 
 test('页面：预览按钮文案为「请求预览投递」；生产按钮文案不变', () => {

@@ -83,6 +83,15 @@ test('V2 SelfTest：覆盖 accepted/replay/rejected/身份 的纯逻辑回归（
   assert.match(st, /(TJ_WINDOWS_PO_QUEUE_DONE_ACK_V1|\$AckSchema)/)
 })
 
+test('V2 脚本：ValidateOne 阻止已误发历史 PO（含 PO-000025 / PO-000026）', () => {
+  const ps = read(PS1)
+  const validate = ps.slice(ps.indexOf('function ValidateOne'), ps.indexOf('function GetConfig'))
+  for (const id of ['PO-000025', 'PO-000026']) {
+    assert.match(validate, new RegExp(`'${id}'`), `ValidateOne 历史 ID 列表必须包含 ${id}`)
+  }
+  assert.match(validate, /HISTORICAL_OR_ISOLATED_ID_BLOCKED/)
+})
+
 test('cmd 包装：SendOne 必须传 POID，不得硬编码旧 PO', () => {
   for (const [file, mode] of [
     ['01_Configure.cmd', 'Configure'],

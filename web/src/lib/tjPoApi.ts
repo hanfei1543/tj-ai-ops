@@ -519,13 +519,10 @@ export async function requestPreviewPush(id: string): Promise<PreviewPushRequest
 /** 预览：读回投递请求状态（用于列表显示；生产环境不调用） */
 export async function listPreviewPushRequests(): Promise<PreviewPushRequestRow[]> {
   if (!IS_PREVIEW_SCHEMA) return []
-  const { data, error } = await db
-    .from('tj_po_preview_push_requests')
-    .select('id, po_header_id, request_id, state, updated_at')
-    .order('updated_at', { ascending: false })
-    .limit(500)
+  const { data, error } = await db.rpc('tj_po_preview_list_push_requests')
   if (error) throw error
-  return (data ?? []) as PreviewPushRequestRow[]
+  if (!Array.isArray(data)) throw new Error('预览投递状态回查未返回数组')
+  return data as PreviewPushRequestRow[]
 }
 
 export async function listExports(poId: string): Promise<PoExportRecord[]> {

@@ -80,6 +80,7 @@ alter table tj_preview.tj_po_preview_push_requests enable row level security;
 revoke all on table tj_preview.tj_po_preview_push_requests from public;
 revoke all on table tj_preview.tj_po_preview_push_requests from anon;
 revoke all on table tj_preview.tj_po_preview_push_requests from authenticated;
+revoke all on table tj_preview.tj_po_preview_push_requests from service_role;
 
 create or replace function tj_preview.tj_po_preview_push_requests_touch()
 returns trigger
@@ -291,6 +292,73 @@ revoke all on function tj_preview.tj_po_preview_require_staff() from public;
 revoke all on function tj_preview.tj_po_preview_require_staff() from anon;
 revoke all on function tj_preview.tj_po_preview_require_staff() from authenticated;
 
+-- Readback uses the same staff authorization, without granting direct table access.
+create or replace function tj_preview.tj_po_preview_list_push_requests()
+returns jsonb
+language plpgsql
+stable security definer
+set search_path = ''
+as $list$
+declare
+  v_result jsonb;
+begin
+  perform tj_preview.tj_po_preview_require_staff();
+  select coalesce(jsonb_agg(to_jsonb(r) order by r.updated_at desc), '[]'::jsonb)
+    into v_result
+    from (
+      select id, po_header_id, request_id, state, updated_at
+      from tj_preview.tj_po_preview_push_requests
+      order by updated_at desc limit 500
+    ) r;
+  return v_result;
+end
+$list$;
+revoke all on function tj_preview.tj_po_preview_list_push_requests() from public, anon, service_role;
+grant execute on function tj_preview.tj_po_preview_list_push_requests() to authenticated;
+
+-- A request or a push intent freezes the business snapshot until historical/manual
+-- review; ACK fields remain writable through the existing controlled verification
+-- channels. Intents are included so legacy_local_unverified sources cannot keep
+-- changing underneath a dispatched export either.
+create or replace function tj_preview.tj_po_preview_snapshot_guard()
+returns trigger
+language plpgsql security definer
+set search_path = ''
+as $snapshot$
+declare
+  v_old uuid;
+  v_new uuid;
+begin
+  if tg_table_name = 'tj_po_headers' then
+    if exists (select 1 from tj_preview.tj_po_preview_push_requests r where r.po_header_id = old.id)
+       or exists (select 1 from tj_preview.tj_po_push_intents i where i.po_header_id = old.id) then
+      if tg_op = 'DELETE' then
+        perform tj_preview.tj_po_ack_fail('PO_PUSH_SNAPSHOT_LOCKED', '投递请求/意图已登记，禁止删除采购单');
+      elsif (to_jsonb(new) - array['irs_po_no','irs_po_no_verified_at','irs_po_no_verified_by','erp_status','updated_at'])
+         is distinct from (to_jsonb(old) - array['irs_po_no','irs_po_no_verified_at','irs_po_no_verified_by','erp_status','updated_at']) then
+        perform tj_preview.tj_po_ack_fail('PO_PUSH_SNAPSHOT_LOCKED', '投递请求/意图已登记，业务字段已锁定，不能修改导出来源');
+      end if;
+    end if;
+  else
+    if tg_op in ('UPDATE','DELETE') then v_old := old.po_header_id; end if;
+    if tg_op in ('UPDATE','INSERT') then v_new := new.po_header_id; end if;
+    if exists (select 1 from tj_preview.tj_po_preview_push_requests r where r.po_header_id in (v_old,v_new))
+       or exists (select 1 from tj_preview.tj_po_push_intents i where i.po_header_id in (v_old,v_new)) then
+      perform tj_preview.tj_po_ack_fail('PO_PUSH_SNAPSHOT_LOCKED', '投递请求/意图已登记，不能增删改或移动明细');
+    end if;
+  end if;
+  if tg_op = 'DELETE' then return old; end if;
+  return new;
+end
+$snapshot$;
+drop trigger if exists trg_tj_po_preview_header_snapshot_guard on tj_preview.tj_po_headers;
+create trigger trg_tj_po_preview_header_snapshot_guard before update or delete on tj_preview.tj_po_headers
+for each row execute function tj_preview.tj_po_preview_snapshot_guard();
+drop trigger if exists trg_tj_po_preview_lines_snapshot_guard on tj_preview.tj_po_lines;
+create trigger trg_tj_po_preview_lines_snapshot_guard before insert or update or delete on tj_preview.tj_po_lines
+for each row execute function tj_preview.tj_po_preview_snapshot_guard();
+revoke all on function tj_preview.tj_po_preview_snapshot_guard() from public, anon, authenticated, service_role;
+
 -- ============================================================================
 -- B. 投递证据链（server_prepared / windows_received）
 -- ============================================================================
@@ -332,6 +400,7 @@ alter table tj_preview.tj_po_push_delivery_evidence enable row level security;
 revoke all on table tj_preview.tj_po_push_delivery_evidence from public;
 revoke all on table tj_preview.tj_po_push_delivery_evidence from anon;
 revoke all on table tj_preview.tj_po_push_delivery_evidence from authenticated;
+revoke all on table tj_preview.tj_po_push_delivery_evidence from service_role;
 
 -- 通用追加式守卫：UPDATE/DELETE/TRUNCATE 一律拒绝（owner 也拒）。
 -- 触发函数属主仍是表 owner，但追加式语义要求连 owner 也只能 INSERT。
@@ -639,7 +708,10 @@ $fn$;
  *   8. 表头+明细合计 == payload.expected_total_rm == ledger.expected_total_rm
  *      （并校验 ledger.expected_lines 的 amount_rm 求和）；
  *   9. 该 PO 尚无标准 ACK accepted 回执 / 无 saved_verified 记录（标准账本是唯一真相，
- *      人工通道不得覆盖它，也不得改写 push intent）。
+ *      人工通道不得覆盖它，也不得改写 push intent）；
+ *  10. 明细逐行 qty/unit_price 不得 NULL（不得用 sum 静默忽略缺失行）；
+ *  11. windows_bridge_v1 意图禁止人工通道（必须走标准 ACK）；legacy_local_unverified
+ *      的历史 source SHA 差异按用户授权允许，并分别保留两套摘要。
  *
  * 幂等：同 event + 同内容 → replay（不新增行）；同 event + 内容变化 → 冲突；
  *       不同 event 撞同一 PO 或同一 IRS → 冲突（表级唯一索引 + 显式判定）。
@@ -769,6 +841,12 @@ begin
       pg_catalog.jsonb_build_object('payload_source_sha256', v_payload_source, 'outbox_source_sha256', v_source)
     );
   end if;
+  if (v_outbox -> 'queue_done_ack') is distinct from 'true'::jsonb then
+    perform tj_preview.tj_po_ack_fail('MANUAL_RECONCILE_DONE_ACK_REQUIRED', 'outbox.queue_done_ack 必须是 JSON boolean true');
+  end if;
+  if v_outbox ->> 'business_po_id' is distinct from v_po_id then
+    perform tj_preview.tj_po_ack_fail('MANUAL_RECONCILE_PO_MISMATCH', 'business_po_id 必须等于 po_id');
+  end if;
   if coalesce(v_outbox ->> 'queue_folder', '') <> 'Done' then
     perform tj_preview.tj_po_ack_fail(
       'MANUAL_RECONCILE_QUEUE_NOT_DONE',
@@ -848,7 +926,7 @@ begin
     pg_catalog.hashtextextended('tj_po_manual_event:' || lower(v_event), 0)
   );
   perform pg_catalog.pg_advisory_xact_lock(
-    pg_catalog.hashtextextended('tj_po_manual_irs:' || v_irs, 0)
+    pg_catalog.hashtextextended('tj_po_irs:' || v_irs, 0)
   );
 
   select * into v_po from tj_preview.tj_po_headers where po_id = v_po_id for update;
@@ -920,7 +998,23 @@ begin
     );
   end if;
 
+  if exists (select 1 from tj_preview.tj_po_headers h where h.id <> v_po.id and h.irs_po_no = v_irs)
+     or exists (select 1 from tj_preview.tj_po_ack_receipts r where r.state = 'accepted'
+       and r.irs_po_number = v_irs and r.po_header_id is distinct from v_po.id) then
+    perform tj_preview.tj_po_ack_fail('MANUAL_RECONCILE_IRS_CONFLICT', 'IRS 号已属于另一张 PO 或标准 accepted 回执，不得人工复用');
+  end if;
+
   -- 8) 金额核验：header+lines 合计 == expected == ledger expected
+  -- 先逐行拒绝 NULL：sum() 会静默忽略 NULL，不能把缺失数量/单价当成 0。
+  if exists (
+    select 1 from tj_preview.tj_po_lines l
+     where l.po_header_id = v_po.id and (l.qty is null or l.unit_price is null)
+  ) then
+    perform tj_preview.tj_po_ack_fail(
+      'MANUAL_RECONCILE_LINE_INCOMPLETE',
+      'PO 明细存在 qty/unit_price 为 NULL 的行，无法逐行核验合计'
+    );
+  end if;
   select coalesce(count(*), 0), coalesce(sum(l.qty * l.unit_price), 0)
     into v_line_count, v_po_total
     from tj_preview.tj_po_lines l
@@ -964,6 +1058,16 @@ begin
   select * into v_intent from tj_preview.tj_po_push_intents i
    where i.po_header_id = v_po.id
    order by i.created_at desc limit 1;
+
+  -- windows_bridge_v1 意图必须走标准 ACK；人工通道不得绕过标准收件证据。
+  -- legacy_local_unverified 的历史差异仍允许，按用户授权保留双摘要对账。
+  if found and coalesce(v_intent.delivery_channel, 'legacy_local_unverified') = 'windows_bridge_v1' then
+    perform tj_preview.tj_po_ack_fail(
+      'MANUAL_RECONCILE_WINDOWS_BRIDGE_FORBIDDEN',
+      'windows_bridge_v1 投递必须走标准 ACK，人工通道不得绕过收件证据',
+      pg_catalog.jsonb_build_object('intent_id', v_intent.id, 'delivery_channel', v_intent.delivery_channel)
+    );
+  end if;
 
   v_actor := nullif(pg_catalog.current_setting('request.jwt.claim.sub', true), '')::uuid;
 
@@ -1140,6 +1244,47 @@ begin
 end
 $fn$;
 
+-- D.5 时序型拒绝（证据尚未到齐）：只追加 audit，不落唯一 receipt 墓碑。
+-- 同一确定性 event 在证据到齐后必须仍能 accepted；旧 needs_review 回执保持
+-- 原样、继续人工核对，本函数绝不改写/删除历史回执。
+create or replace function tj_preview.tj_po_ack_pending(
+  p_event_id text,
+  p_code text,
+  p_po_header_id uuid,
+  p_po_id text,
+  p_irs text,
+  p_actor uuid,
+  p_detail jsonb default '{}'::jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $fn$
+begin
+  insert into tj_preview.tj_po_ack_audit (event_id, action, code, actor, detail)
+  values (
+    p_event_id, 'defer', p_code, p_actor,
+    coalesce(p_detail, '{}'::jsonb) || pg_catalog.jsonb_build_object(
+      'retryable', true, 'receipt_written', false, 'via', 'stage25_wrapper',
+      'po_header_id', p_po_header_id
+    )
+  );
+
+  return pg_catalog.jsonb_build_object(
+    'accepted', false, 'replayed', false, 'rejected', true,
+    'state', 'needs_review', 'code', p_code,
+    'retryable', true, 'receipt_id', null,
+    'po_id', p_po_id, 'irs_po_number', p_irs
+  );
+end
+$fn$;
+
+revoke all on function tj_preview.tj_po_ack_pending(text, text, uuid, text, text, uuid, jsonb) from public;
+revoke all on function tj_preview.tj_po_ack_pending(text, text, uuid, text, text, uuid, jsonb) from anon;
+revoke all on function tj_preview.tj_po_ack_pending(text, text, uuid, text, text, uuid, jsonb) from authenticated;
+revoke all on function tj_preview.tj_po_ack_pending(text, text, uuid, text, text, uuid, jsonb) from service_role;
+
 /**
  * tj_po_ack_ingest —— 标准 ACK 入口（Stage25 强化版）。
  *
@@ -1151,10 +1296,13 @@ $fn$;
  *  4. IRS 号必须形如 ^PO[0-9]{8}$；
  *  5. verification=MANUAL_POSTSAVE_VERIFIED、queue_folder=Done、ledger_state=SAVED_VERIFIED_QUEUE_DONE；
  *  6. source_sha256 / queue_done_sha256 均为 64hex 且相等；
- *  7. 对应投递意图必须是 windows_bridge_v1 且存在 windows_received 收件证据、哈希一致
- *     （legacy_local_unverified 一律 PO_ACK_NO_WINDOWS_RECEIPT）；
+ *  7. 对应投递意图必须是 windows_bridge_v1（legacy_local_unverified 一律
+ *     PO_ACK_NO_WINDOWS_RECEIPT 落审计/拒绝）；
  *  8. 已保存的 irs_po_no 不得被新 event 覆盖（PO_ACK_IRS_OVERWRITE）；
- *  9. event / IRS advisory lock + header row lock；同 event 同指纹仍安全 replay。
+ *  9. event / IRS advisory lock + header row lock；同 event 同指纹仍安全 replay；
+ * 10. 无 intent / intent 未 delivered / 暂缺 windows_received 证据属于时序未齐：
+ *     只追加 audit + retryable=true 的 needs_review 信封，不写 receipt 墓碑；
+ *     证据到齐后同一确定性 event 仍可 accepted。SHA 不一致等真实冲突仍落 receipt。
  * 其余判定（SHA 对比意图、PO 不存在、IRS 占用、落库）继续委派
  * tj_po_ack_ingest_v1_internal 处理。
  */
@@ -1239,7 +1387,7 @@ begin
 
   -- 确定性 event_id：Stage23 客户端算法的服务端复核
   v_expected_event := tj_preview.tj_po_ack_event_id(v_po_id, v_source, v_irs);
-  if lower(v_event_id) <> v_expected_event then
+  if v_event_id <> v_expected_event then
     perform tj_preview.tj_po_ack_fail(
       'PO_ACK_EVENT_ID_MISMATCH',
       'event_id 不是由 po_id + UPPER(source_sha256) + irs_po_number 推导的确定性事件',
@@ -1252,7 +1400,7 @@ begin
     pg_catalog.hashtextextended('tj_po_ack_event:' || lower(v_event_id), 0)
   );
   perform pg_catalog.pg_advisory_xact_lock(
-    pg_catalog.hashtextextended('tj_po_ack_irs:' || v_irs, 0)
+    pg_catalog.hashtextextended('tj_po_irs:' || v_irs, 0)
   );
 
   -- 幂等：同 event 同指纹 → replay（不新增回执）；不同指纹 → 冲突
@@ -1286,30 +1434,21 @@ begin
   end if;
 
   -- 已保存的 IRS 号不得被新 event 覆盖
-  if v_po.irs_po_no is not null and btrim(v_po.irs_po_no) <> '' then
-    if btrim(v_po.irs_po_no) = v_irs then
-      -- 同 PO 同 IRS 已保存：若已有 accepted 回执则按 replay 返回，不重复写账本
-      select * into v_receipt from tj_preview.tj_po_ack_receipts
-       where po_header_id = v_po.id and state = 'accepted' and irs_po_number = v_irs
-       order by received_at desc limit 1;
-      if found then
-        insert into tj_preview.tj_po_ack_audit (event_id, action, code, actor, detail)
-        values (v_event_id, 'replay', 'PO_ACK_REPLAY', v_uid,
-                pg_catalog.jsonb_build_object('receipt_id', v_receipt.id, 'state', v_receipt.state,
-                  'reason', 'header 已保存同一 IRS 号'));
-        return pg_catalog.jsonb_build_object(
-          'accepted', true, 'replayed', true, 'rejected', false,
-          'state', v_receipt.state, 'code', 'PO_ACK_REPLAY',
-          'receipt_id', v_receipt.id, 'po_id', v_receipt.po_id,
-          'irs_po_number', v_receipt.irs_po_number
-        );
-      end if;
-    else
-      return tj_preview.tj_po_ack_reject(
-        v_event_id, v_fingerprint, 'PO_ACK_IRS_OVERWRITE', v_po.id, v_po.po_id, v_irs, p_payload, v_uid,
-        pg_catalog.jsonb_build_object('header_irs_po_no', v_po.irs_po_no, 'payload_irs_po_number', v_irs)
-      );
-    end if;
+  if v_po.irs_po_no is not null and btrim(v_po.irs_po_no) <> ''
+     and btrim(v_po.irs_po_no) <> v_irs then
+    return tj_preview.tj_po_ack_reject(
+      v_event_id, v_fingerprint, 'PO_ACK_IRS_OVERWRITE', v_po.id, v_po.po_id, v_irs, p_payload, v_uid,
+      pg_catalog.jsonb_build_object('header_irs_po_no', v_po.irs_po_no, 'payload_irs_po_number', v_irs)
+    );
+  end if;
+  -- Exact event+fingerprint replay was already checked above. Same IRS alone does
+  -- not prove replay: a changed source SHA must never bypass receipt validation.
+  if exists (select 1 from tj_preview.tj_po_ack_receipts r
+      where r.po_header_id = v_po.id and r.state = 'accepted') then
+    return tj_preview.tj_po_ack_reject(
+      v_event_id, v_fingerprint, 'PO_ACK_ALREADY_SAVED', v_po.id, v_po.po_id, v_irs, p_payload, v_uid,
+      pg_catalog.jsonb_build_object('reason', '已有 accepted 事件，新的 source/event 不是幂等重放')
+    );
   end if;
 
   -- 人工对账通道优先：同一 PO 已由 manual_reconcile 落账时，标准 ACK 不得改写其证据
@@ -1326,7 +1465,21 @@ begin
    where i.po_header_id = v_po.id
    order by i.updated_at desc limit 1;
   if not found then
-    return tj_preview.tj_po_ack_ingest_v1_internal(p_payload);
+    -- 时序型：投递尚未登记。只写审计，不落 receipt 墓碑，证据到齐后同一 event 可重试。
+    return tj_preview.tj_po_ack_pending(
+      v_event_id, 'PO_ACK_NO_PUSH_DELIVERY', v_po.id, v_po.po_id, v_irs, v_uid,
+      pg_catalog.jsonb_build_object('po_id', v_po.po_id,
+        'reason', '尚无该 PO 的投递意图，等待 Windows bridge 投递完成后重试')
+    );
+  end if;
+
+  if v_intent.state <> 'delivered' then
+    -- 时序型：意图已登记但未确认投递（不论通道）。只写审计，不落 receipt 墓碑。
+    return tj_preview.tj_po_ack_pending(
+      v_event_id, 'PO_ACK_NO_PUSH_DELIVERY', v_po.id, v_po.po_id, v_irs, v_uid,
+      pg_catalog.jsonb_build_object('intent_id', v_intent.id, 'intent_state', v_intent.state,
+        'reason', '投递意图尚未 delivered，等待 Windows 收件证据')
+    );
   end if;
 
   if coalesce(v_intent.delivery_channel, 'legacy_local_unverified') <> 'windows_bridge_v1' then
@@ -1337,20 +1490,25 @@ begin
     );
   end if;
 
-  if v_intent.state <> 'delivered' then
-    -- 交由 v1 主体给出既有语义（PO_ACK_NO_PUSH_DELIVERY / needs_review）
-    return tj_preview.tj_po_ack_ingest_v1_internal(p_payload);
-  end if;
-
   select lower(e.xlsx_sha256) into v_evidence_sha
     from tj_preview.tj_po_push_delivery_evidence e
    where e.intent_id = v_intent.id and e.stage = 'windows_received';
-  if not found or v_evidence_sha is distinct from lower(v_source) then
+  if not found then
+    -- 时序型：已 delivered 但收件证据尚未写入。只写审计，不落 receipt 墓碑。
+    return tj_preview.tj_po_ack_pending(
+      v_event_id, 'PO_ACK_NO_WINDOWS_RECEIPT', v_po.id, v_po.po_id, v_irs, v_uid,
+      pg_catalog.jsonb_build_object('intent_id', v_intent.id,
+        'reason', '缺少 windows_received 收件证据，等待 bridge 收件回执')
+    );
+  end if;
+
+  if v_evidence_sha is distinct from lower(v_source) then
+    -- 真实冲突（不是时序）：仍按业务拒绝落审计 + receipt，绝不放宽。
     return tj_preview.tj_po_ack_reject(
-      v_event_id, v_fingerprint, 'PO_ACK_NO_WINDOWS_RECEIPT', v_po.id, v_po.po_id, v_irs, p_payload, v_uid,
+      v_event_id, v_fingerprint, 'PO_ACK_DELIVERY_HASH_MISMATCH', v_po.id, v_po.po_id, v_irs, p_payload, v_uid,
       pg_catalog.jsonb_build_object('intent_id', v_intent.id,
         'windows_received_sha256', v_evidence_sha, 'payload_source_sha256', v_source,
-        'reason', '缺少 windows_received 收件证据或哈希不一致')
+        'reason', 'windows_received 收件证据哈希与 payload source_sha256 不一致')
     );
   end if;
 
@@ -1380,6 +1538,7 @@ revoke all on function tj_preview.tj_po_ack_reject(text, text, text, uuid, text,
 -- alter function tj_preview.tj_po_ack_ingest_v1_internal(jsonb) rename to tj_po_ack_ingest;
 -- grant execute on function tj_preview.tj_po_ack_ingest(jsonb) to authenticated;
 -- drop function if exists tj_preview.tj_po_ack_reject(text, text, text, uuid, text, text, jsonb, uuid, jsonb);
+-- drop function if exists tj_preview.tj_po_ack_pending(text, text, uuid, text, text, uuid, jsonb);
 -- drop function if exists tj_preview.tj_po_ack_fingerprint(jsonb);
 -- drop function if exists tj_preview.tj_po_ack_event_id(text, text, text);
 -- drop function if exists tj_preview.tj_po_manual_reconcile(jsonb);

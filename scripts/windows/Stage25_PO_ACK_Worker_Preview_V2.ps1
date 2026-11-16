@@ -81,7 +81,7 @@ function InRoot([string]$p,[string]$root) {
 }
 function ValidateOne([string]$id) {
     if ($id -cnotmatch '^PO-[0-9]{6}$') { Fail 'PO_ID_REQUIRED_PO_6_DIGITS' }
-    if ($id -in @('PO-000005','PO-000011','PO-900003','PO-878329','PO-988881')) { Fail 'HISTORICAL_OR_ISOLATED_ID_BLOCKED' }
+    if ($id -in @('PO-000005','PO-000011','PO-000025','PO-000026','PO-900003','PO-878329','PO-988881')) { Fail 'HISTORICAL_OR_ISOLATED_ID_BLOCKED' }
     $outpath=Join-Path $OutboxDir ($id+'.done-ack.json')
     if (-not (Test-Path -LiteralPath $outpath -PathType Leaf)) { Fail 'STAGE23_OUTBOX_MISSING' }
     $raw=[IO.File]::ReadAllText($outpath,[Text.Encoding]::UTF8)

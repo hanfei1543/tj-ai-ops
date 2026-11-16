@@ -57,10 +57,23 @@ test('Stage25 迁移：权限模型（手动通道 postgres-only，helper 撤权
       code,
       new RegExp(`revoke all on function tj_preview\\.tj_po_manual_reconcile\\(jsonb\\) from ${role}`, 'i'),
     )
+    assert.match(
+      code,
+      new RegExp(`revoke all on function tj_preview\\.tj_po_ack_pending\\([^)]*\\) from ${role}`, 'i'),
+      `时序 pending helper 必须撤销 ${role} EXECUTE`,
+    )
   }
   assert.match(code, /revoke all on function tj_preview\.tj_po_ack_ingest_v1_internal\(jsonb\) from authenticated/i)
   assert.match(code, /grant execute on function tj_preview\.tj_po_ack_ingest\(jsonb\) to authenticated/i)
   assert.match(code, /grant execute on function tj_preview\.tj_po_preview_request_push\(uuid, text\) to authenticated/i)
+  // 新表必须显式撤销 service_role（不扩大任何表权限）
+  for (const table of ['tj_po_preview_push_requests', 'tj_po_push_delivery_evidence']) {
+    assert.match(
+      code,
+      new RegExp(`revoke all on table tj_preview\\.${table} from service_role`, 'i'),
+      `${table} 必须显式 revoke service_role`,
+    )
+  }
 })
 
 test('Stage25 迁移：人工对账与证据表是追加式（禁止 UPDATE/DELETE/TRUNCATE）', () => {

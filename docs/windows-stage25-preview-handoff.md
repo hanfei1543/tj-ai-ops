@@ -40,6 +40,11 @@ ssh -t -i "$env:USERPROFILE\.ssh\hermes-xeon" hermes@167.104.103.163 "python3 /h
 
 ## 3. 执行顺序
 
+本轮唯一新测试单为 `PO-000028`，已在真实 Pending 收到；不要重新下载/生成其 XLSX，
+不要再投递旧单25/26。Windows V2在目标机的SelfTest/Configure/Login仍待执行。
+只有用户完成该新单真实IRS保存、人工回查和Stage23 Done/Ledger/Outbox后，才运行
+`04_SendOne_POID.cmd PO-000028`。这份包不负责IRS保存，也不代表网页已部署。
+
 1. `03_SelfTest.cmd`（无需配置，先证明判定逻辑正常）
    期望最后一行包含：`STAGE25_PREVIEW_V2_OFFLINE_PASS=True | ACK_VERDICT_TABLE=True | ... | NO_NETWORK=True`
 2. `01_Configure.cmd` → 依次输入第 1、2、4 项；看到 `SCHEMA_FIXED=tj_preview`
