@@ -60,3 +60,11 @@
 ## 2026-11-13 13:32 — PO Date + Unified GR 整合（档三换会话）
 
 - 隔离分支 integration/po-date-gr-v2 完成 PO Date + Unified GR 整合：tj_gr_po_save 修复 + 统一 API 签名 + normalizeDecimal 精度 + PO Push 幂等保留；209 测试/tsc/build/PGlite 全绿；两条 20261114 migration 未应用、待单独授权。
+
+## 2026-11-16 10:38 — Stage25最终修复、凭据交接与Worker轮换交接
+
+- Worker安全轮换：Auth新强密码登录通过、旧密码拒绝；两个既有私有worker配置均同步且保持0600，SHOW内存解析确认读取新密码。单用户global注销HTTP204，旧refresh实际被拒，目标auth.sessions及未撤销refresh均0，其他用户会话/refresh记录摘要不变。旧access JWT无法由注销立即撤销，现配置有效期3600秒；未改全局签名/认证设置。非敏感状态证据在原仓private/stage25-evidence/worker-password-rotation-status.json；无凭据入Git，无业务API/Windows/ACK操作，无V2部署。用户已报告真实SSH SHOW成功，Windows新密码Login待本人执行。
+- 凭据交接根因已核实：路径及UTF8/键值解析正常，实际TJ_六字段齐全，旧脚本无别名映射并误要求QUEUE_ROOT。仅修VPS helper：显式映射、已确认Queue默认值、Preview schema/RPC约束、别名冲突只报字段名。真实私有配置仅内存解析后输出布尔校验，env字节/mtime/权限与WindowsV2脚本均未变；TTY/SHOW保护未绕过。全量354/354通过（含7条Python夹具回归），未打印/捕获真实显示分支、未连DB/Windows/ACK。
+- Goods Receive Date业务规则审计及旧接续检查点已落盘；旧阶段结论以实际实现与本次交接边界为准。
+- Stage25整合推送器、网站受控状态RPC、8列日期XLSX、Windows V2；主脑独立复核真实桥协议与两级证据。最终补齐时序拒绝只写审计、legacy来源锁、NULL单价拒绝、manual bridge禁入和权限撤销；353/353回归和Preview build通过，142条真实SQL断言通过。最终closure SHA256=9cd8ada054e8b0d9630605abe1e1e5b4604e10a84df4ed729b4520123e0ae2a7已真实应用tj_preview并读回。
+- PO-000026人工对账id=a4e6434b-80c8-444b-8752-e529bc01f70a，IRS=PO26000784，分类manual_delivery_historical_import，旧证据保留；PO-000028真实收件SHA256=2d8f5d3d7be40803233989b65e24377b5fd1d1c63bcd0441ed2df8910f0f68ca，禁止重新投递。新单尚无IRS/Done/ACK，不称全链路完成。私有证据路径在交接单。
