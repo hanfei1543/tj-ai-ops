@@ -18,6 +18,7 @@ const AD = (process.env.APPDATA || 'C:\\Users\\Administrator\\AppData\\Roaming')
 // Hermes 只写 Pending；Processing/Done/Failed 由本机 Queue Runner 管理，Hermes 不碰。
 const WRITE_ALLOW = [
   'C:\\Users\\Administrator\\Desktop\\operation\\PO_Queue\\Pending',
+  'C:\\Users\\Administrator\\Desktop\\operation\\GR_Queue\\Pending',
 ];
 const MAX_WRITE_BYTES = 20 * 1024 * 1024; // 20MB 上限
 

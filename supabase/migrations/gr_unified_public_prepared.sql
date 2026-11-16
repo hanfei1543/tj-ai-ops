@@ -682,7 +682,7 @@ stable
 security definer
 set search_path = ''
 as $fn$
-  select pg_catalog.string_agg(public.tj_gr_kv(x.k, x.v), chr(10) order by x.k)
+  select pg_catalog.string_agg(public.tj_gr_kv(x.k, x.v), chr(10) order by x.k collate "C")
   from public.tj_gr_event_kv(p_event_id) as x
 $fn$;
 
@@ -1130,7 +1130,7 @@ as $fn$
              pg_catalog.to_char(i, 'FM0000'), pg_catalog.to_char(j, 'FM0000')),
              public.tj_gr_dec_text((src ->> 'accepted_qty')::numeric) from ossrc
   )
-  select pg_catalog.string_agg(public.tj_gr_kv(k, v), chr(10) order by k)
+  select pg_catalog.string_agg(public.tj_gr_kv(k, v), chr(10) order by k collate "C")
   from (
     select k, v from ev
     union all select k, v from linekv
