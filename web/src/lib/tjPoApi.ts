@@ -20,6 +20,8 @@ import {
   submitCombinedForApprovalFlow,
 } from './core/approve-flow.js'
 import { formatWebsitePoDate } from './core/po-lines.js'
+import { parsePreviewPushResponse } from './core/preview-push.js'
+import type { PreviewPushRequest } from './core/preview-push'
 
 export { IS_PREVIEW_SCHEMA }
 
@@ -477,6 +479,53 @@ export async function requestPush(id: string): Promise<void> {
     .eq('id', id)
     .limit(1)
   if (error) throw error
+}
+
+/** 预览投递请求行（只读回显示；生产不查询该表） */
+export interface PreviewPushRequestRow {
+  id: string
+  po_header_id: string
+  request_id: string
+  state: string
+  updated_at?: string
+}
+
+/**
+ * 预览：请求一次投递到 Windows「预览」队列。
+ *
+ *   * 只走 RPC tj_po_preview_request_push（服务端校验 GR staff/approver/admin、
+ *     standard confirmed、Website PO Date、非合并来源、无保存、无历史投递 intent）。
+ *   * **不设 pending_push**：预览不进入生产 cron 推送路径。
+ *   * 返回 {id, po_id, state}；结构不完整/PO 不符/未知状态一律拒绝当作成功。
+ *   * 一次点击只生成一个新 request_id；重复点击会生成新请求，服务端按 intent/保存
+ *     状态拒绝实际投递，绝不让同一 PO 被 Windows 收两次。
+ */
+export async function requestPreviewPush(id: string): Promise<PreviewPushRequest> {
+  if (!IS_PREVIEW_SCHEMA) {
+    throw new Error(
+      '请求预览投递只在预览环境（tj_preview）可用；生产推送请使用「发送采购 PO 到电脑」',
+    )
+  }
+  if (!id) throw new Error('缺少采购单 id，无法请求预览投递')
+  const requestId = `req.preview.${crypto.randomUUID()}`
+  const { data, error } = await db.rpc('tj_po_preview_request_push', {
+    p_po_header_id: id,
+    p_request_id: requestId,
+  })
+  if (error) throw error
+  return parsePreviewPushResponse(data)
+}
+
+/** 预览：读回投递请求状态（用于列表显示；生产环境不调用） */
+export async function listPreviewPushRequests(): Promise<PreviewPushRequestRow[]> {
+  if (!IS_PREVIEW_SCHEMA) return []
+  const { data, error } = await db
+    .from('tj_po_preview_push_requests')
+    .select('id, po_header_id, request_id, state, updated_at')
+    .order('updated_at', { ascending: false })
+    .limit(500)
+  if (error) throw error
+  return (data ?? []) as PreviewPushRequestRow[]
 }
 
 export async function listExports(poId: string): Promise<PoExportRecord[]> {

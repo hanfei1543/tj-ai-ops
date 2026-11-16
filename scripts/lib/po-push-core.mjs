@@ -104,6 +104,28 @@ function normalizeDecimalString(s) {
 }
 
 /**
+ * XLSX 文件字节指纹（与 ACK source_sha256 / 投递清单 xlsx_sha256 同算法同字节）：
+ * sha256 over 导出文件的精确 bytes，小写 hex。绝不与 content_sha256（业务 JSON）互比。
+ * @param {Buffer|Uint8Array|ArrayBuffer} bytes
+ * @returns {string} 64 位小写十六进制
+ */
+export function computeXlsxSha256(bytes) {
+  if (bytes === null || bytes === undefined) {
+    throw new Error('computeXlsxSha256 需要 XLSX 文件字节（不能对空值计算哈希）')
+  }
+  let buf
+  if (Buffer.isBuffer(bytes)) buf = bytes
+  else if (bytes instanceof Uint8Array) buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  else if (bytes instanceof ArrayBuffer) buf = Buffer.from(bytes)
+  else {
+    throw new Error(
+      'computeXlsxSha256 只接受 Buffer / Uint8Array / ArrayBuffer（Blob 请先 await arrayBuffer()）',
+    )
+  }
+  return createHash('sha256').update(buf).digest('hex')
+}
+
+/**
  * 投递内容指纹：只取业务字段（排除 status/updated_at/created_at/frozen/po_revision
  * 等可变状态），按固定键序 JSON 序列化后 sha256。同 PO 同内容恒同 sha；改任何
  * 业务字段（含 website_po_date / 行 qty / 单价 / 描述）必得不同 sha。
@@ -256,13 +278,15 @@ export function createPusher({
   }
 
   /** 规则 1：调用 bridge 之前先持久化 dispatch_started（UNIQUE(po_header_id) 兜底并发） */
-  async function insertIntent({ poHeaderId, poId, contentSha256, state }) {
+  async function insertIntent({ poHeaderId, poId, contentSha256, xlsxSha256 = null, state }) {
     await sbFetch(PUSH_INTENT_TABLE, {
       method: 'POST',
       body: JSON.stringify({
         po_header_id: poHeaderId,
         po_id: poId,
         content_sha256: contentSha256,
+        // 文件字节指纹：ACK 的 source_sha256 只与这个比较（绝不与 content_sha256 互比）
+        xlsx_sha256: xlsxSha256,
         state,
       }),
     })
@@ -356,6 +380,7 @@ export function createPusher({
     }
 
     const buf = await buildXlsx(latest, Array.isArray(lines) ? lines : [])
+    const xlsxSha256 = computeXlsxSha256(buf)
     const filename = `${latest.po_id}.xlsx`
 
     // 规则 1：调用 bridge 之前，先持久化 dispatch_started 投递意图。
@@ -365,6 +390,7 @@ export function createPusher({
         poHeaderId: latest.id,
         poId: latest.po_id,
         contentSha256: contentSha,
+        xlsxSha256,
         state: PUSH_INTENT_STATES.DISPATCH_STARTED,
       })
     } catch (e) {

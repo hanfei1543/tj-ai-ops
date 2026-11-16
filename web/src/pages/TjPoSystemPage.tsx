@@ -22,17 +22,21 @@ import {
   getPo,
   IS_PREVIEW_SCHEMA,
   listPos,
+  listPreviewPushRequests,
   reorderLines,
+  requestPreviewPush,
   requestPush,
   searchItems,
   searchSuppliers,
   updatePo,
 } from '@/lib/tjPoApi'
+import type { PreviewPushRequestRow } from '@/lib/tjPoApi'
 import type { Item, PoHeader, PoLineInput, Supplier } from '@/types/tjPo'
 import { isCombinableSource, isReceivablePoStatus, addDecimalStrings, multiplyDecimalStrings } from '@/lib/core/gr-form.js'
 import { toPoLineInputs } from '@/lib/core/po-input.js'
 import { formatWebsitePoDate } from '@/lib/core/po-lines.js'
 import { poStatusInfo } from '@/lib/core/ui-labels.js'
+import { previewPushStateInfo } from '@/lib/core/preview-push.js'
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -319,6 +323,10 @@ function PoList({
   const [selected, setSelected] = useState<Set<string>>(new Set())
   // 状态筛选：只按后端真实状态分组，不虚构假状态
   const [filter, setFilter] = useState<string>('all')
+  // 预览投递请求（只读回显示；生产环境不查询该表）
+  const [previewPushByPoId, setPreviewPushByPoId] = useState<
+    Record<string, PreviewPushRequestRow>
+  >({})
 
   // Add New Item 暂停：界面不显示入口，旧快捷键入口也已移除（直链进入只看到停用说明，
   // 写 API 同样被拒绝），避免任何隐藏路径绕过暂停。
@@ -334,6 +342,19 @@ function PoList({
         .then((r) => mounted && setPos(r))
         .catch((e) => mounted && setError(e.message))
         .finally(() => mounted && setLoading(false))
+      // 预览：读回 request/state（不改变状态；未应用迁移时静默降级，不影响列表）
+      if (IS_PREVIEW_SCHEMA) {
+        listPreviewPushRequests()
+          .then((rows) => {
+            if (!mounted) return
+            const latest: Record<string, PreviewPushRequestRow> = {}
+            for (const row of rows) {
+              if (!latest[row.po_header_id]) latest[row.po_header_id] = row
+            }
+            setPreviewPushByPoId(latest)
+          })
+          .catch(() => {})
+      }
     }
     load()
     // 每 5 秒轮询刷新：VPS 推送完成后「推送中…」自动变「已导出」，无需手动刷新
@@ -343,6 +364,34 @@ function PoList({
       clearInterval(timer)
     }
   }, [])
+
+  // 预览：请求一次投递（不设 pending_push，不进生产 cron）；随后读回 request/state
+  async function handlePreviewRequest(p: PoHeader) {
+    setExportingId(p.id)
+    setError('')
+    try {
+      const res = await requestPreviewPush(p.id)
+      setPreviewPushByPoId((prev) => ({
+        ...prev,
+        [p.id]: {
+          id: res.id,
+          po_header_id: p.id,
+          request_id: res.requestId ?? '',
+          state: res.state,
+        },
+      }))
+      const rows = await listPreviewPushRequests()
+      const latest: Record<string, PreviewPushRequestRow> = {}
+      for (const row of rows) {
+        if (!latest[row.po_header_id]) latest[row.po_header_id] = row
+      }
+      setPreviewPushByPoId(latest)
+    } catch (e: any) {
+      setError(e.message || '请求预览投递失败')
+    } finally {
+      setExportingId('')
+    }
+  }
 
   async function handleExportPo(p: PoHeader) {
     setExportingId(p.id)
@@ -504,6 +553,10 @@ function PoList({
               const combinable = isCombinableSource(p)
               const notCombinable = combineMode && !combinable
               const receivable = isReceivablePoStatus(p.status)
+              const previewInfo =
+                IS_PREVIEW_SCHEMA && previewPushByPoId[p.id]
+                  ? previewPushStateInfo(previewPushByPoId[p.id].state)
+                  : null
               return (
                 <li
                   key={p.id}
@@ -541,6 +594,11 @@ function PoList({
                       采购日期 {p.website_po_date ?? '—'} · {p.line_count ?? 0} 项
                     </div>
                     {hint && <div className="mt-1 text-xs text-slate-400">{hint}</div>}
+                    {previewInfo && (
+                      <div className="mt-1 text-xs font-medium text-slate-500" title={previewInfo.hint}>
+                        预览投递：{previewInfo.label}
+                      </div>
+                    )}
                   </button>
                   {/* 技术详情：内部编号/开单人/来源单，普通员工默认不展开 */}
                   <details className="shrink-0 text-xs text-slate-400">
@@ -586,6 +644,18 @@ function PoList({
                     >
                       {exportingId === p.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
                       发送采购 PO 到电脑
+                    </button>
+                  )}
+                  {!combineMode && IS_PREVIEW_SCHEMA && p.status === 'confirmed' && p.po_type !== 'combined' && !combinedSourcePoNumbers.has(p.po_id) && (
+                    <button
+                      type="button"
+                      onClick={() => handlePreviewRequest(p)}
+                      disabled={exportingId === p.id}
+                      title="预览环境：只投递到 Windows 预览队列，不会创建 IRS 单据，也不会进入生产推送队列"
+                      className="flex shrink-0 items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-1.5 text-xs font-semibold text-sky-700 hover:bg-sky-100 disabled:opacity-50"
+                    >
+                      {exportingId === p.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+                      请求预览投递
                     </button>
                   )}
                 </li>

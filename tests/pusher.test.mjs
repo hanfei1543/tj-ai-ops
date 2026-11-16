@@ -320,3 +320,20 @@ test('pending 为空时不调用 bridge（cron 无噪声）', async () => {
   assert.deepEqual(summary, { scanned: 0, pushed: [], rejected: [], failed: [] })
   assert.equal(br.calls.length, 0)
 })
+
+test('生产投递意图同时记录 xlsx_sha256（文件字节），与 content_sha256（业务 JSON）分开', async () => {
+  const { createHash } = await import('node:crypto')
+  const { pusher, sb, br } = buildPusher(
+    { pending: [HDR_STANDARD], combined: [], linesByHeaderId: { 'uuid-5': LINES_STANDARD } },
+    { ok: true },
+  )
+  await pusher.runOnce()
+  const post = sb.calls.find((c) => c.method === 'POST' && c.pathAndQuery.startsWith('tj_po_push_intents'))
+  assert.ok(post, '必须写投递意图')
+  const body = JSON.parse(post.body)
+  const written = Buffer.from(br.calls[0].body.write.b64, 'base64')
+  const fileSha = createHash('sha256').update(written).digest('hex')
+  assert.equal(body.xlsx_sha256, fileSha, 'xlsx_sha256 必须是导出文件精确字节的 sha256')
+  assert.match(body.content_sha256, /^[0-9a-f]{64}$/)
+  assert.notEqual(body.content_sha256, body.xlsx_sha256, '业务摘要不得当文件哈希用')
+})
