@@ -72,12 +72,14 @@ export interface GrReceiptEvent {
   checked_by?: string | null
   note?: string | null
   submitted_by?: string | null
+  submitted_by_name?: string | null
   submitted_at?: string | null
   /** 服务端真实字段：存在异常/疑似重复单时需要复核（不是 needs_review 事件状态） */
   review_required?: boolean
   allow_exceptions?: boolean
   review_note?: string | null
   approved_by?: string | null
+  approved_by_name?: string | null
   approved_at?: string | null
   released_at?: string | null
   payload_sha256?: string | null
@@ -85,6 +87,8 @@ export interface GrReceiptEvent {
   exceptions?: GrWarningOrException[]
   exception_count?: number
   created_at?: string | null
+  created_by?: string | null
+  created_by_name?: string | null
   updated_at?: string | null
   lines?: GrReceiptLine[]
   tasks?: GrTask[]

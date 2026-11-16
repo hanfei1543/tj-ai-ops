@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { Loader2, LogIn, LogOut, ShieldCheck } from 'lucide-react'
-import { GR_AUTH_AVAILABLE, signInWithPassword, signOutGr, useGrIdentity } from '@/lib/grAuth'
+import { GR_AUTH_AVAILABLE, signInWithUsername, signOutGr, useGrIdentity } from '@/lib/grAuth'
 import type { GrIdentity } from '@/lib/grAuth'
 import { capabilities } from '@/lib/core/gr-form.js'
 import type { GrCapabilities } from '@/lib/core/gr-form.js'
@@ -33,7 +33,7 @@ function PreviewDisabled() {
 }
 
 function LoginCard({ onDone }: { onDone: () => void }) {
-  const [email, setEmail] = useState('')
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -44,7 +44,7 @@ function LoginCard({ onDone }: { onDone: () => void }) {
     setBusy(true)
     setError('')
     try {
-      await signInWithPassword(email, password)
+      await signInWithUsername(username, password)
       onDone()
     } catch (err) {
       setError(err instanceof Error ? err.message : '登录失败')
@@ -58,17 +58,20 @@ function LoginCard({ onDone }: { onDone: () => void }) {
       <form onSubmit={submit} className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
         <h1 className="text-lg font-bold text-slate-900">统一收货登录</h1>
         <p className="mt-1 text-xs text-slate-500">
-          预览环境使用 Supabase Auth 账号登录。核对人身份自动来自登录，不需要员工手填。
+          用你的用户名 + 密码登录（用户名不分大小写）。核对人身份自动来自登录，不需要员工手填。
         </p>
         {error && (
           <div className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</div>
         )}
-        <label className="mt-4 block text-xs font-medium text-slate-600">邮箱</label>
+        <label className="mt-4 block text-xs font-medium text-slate-600">用户名</label>
         <input
-          type="email"
+          type="text"
           autoComplete="username"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
+          autoCapitalize="none"
+          spellCheck={false}
+          placeholder="例如 TohGL"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
           className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
         />
         <label className="mt-3 block text-xs font-medium text-slate-600">密码</label>

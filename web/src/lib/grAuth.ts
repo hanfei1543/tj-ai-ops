@@ -20,7 +20,7 @@ function displayNameOf(user: {
   user_metadata?: Record<string, unknown> | null
 }): string {
   const meta = user.user_metadata ?? {}
-  const fromMeta = [meta.full_name, meta.name, meta.display_name].find(
+  const fromMeta = [meta.username, meta.full_name, meta.name, meta.display_name].find(
     (v) => typeof v === 'string' && v.trim(),
   ) as string | undefined
   if (fromMeta) return fromMeta.trim()
@@ -28,14 +28,22 @@ function displayNameOf(user: {
   return email.includes('@') ? email.split('@')[0] : email
 }
 
-/** 密码登录（Supabase Auth）。仅预览环境启用；错误信息原样抛给界面 */
-export async function signInWithPassword(email: string, password: string): Promise<void> {
+/** 员工用户名 → 内部邮箱（大小写不敏感登录；显示名保留大小写，见 displayNameOf） */
+const USERNAME_DOMAIN = 'tj-preview.internal'
+
+export function usernameToEmail(username: string): string {
+  const u = username.trim().toLowerCase()
+  return u ? `${u}@${USERNAME_DOMAIN}` : ''
+}
+
+/** 用户名+密码登录（Supabase Auth）。仅预览环境启用；用户名大小写不敏感 */
+export async function signInWithUsername(username: string, password: string): Promise<void> {
   if (!IS_PREVIEW_SCHEMA) {
     throw new Error('仅供预览环境登录：生产环境不使用新的可信身份界面')
   }
-  const e = email.trim()
-  if (!e || !password) throw new Error('请输入邮箱与密码')
-  const { error } = await supabase.auth.signInWithPassword({ email: e, password })
+  const email = usernameToEmail(username)
+  if (!email || !password) throw new Error('请输入用户名与密码')
+  const { error } = await supabase.auth.signInWithPassword({ email, password })
   if (error) throw new Error(`登录失败：${error.message}`)
 }
 

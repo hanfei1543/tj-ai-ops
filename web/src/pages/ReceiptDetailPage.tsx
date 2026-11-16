@@ -315,7 +315,7 @@ export default function ReceiptDetailPage({ identity, caps }: { identity: GrIden
           <Field label="Delivery Order">{event.delivery_order_no || '—'}</Field>
           <Field label="发票日期">{event.invoice_date || '—'}</Field>
           <Field label="核对人（登录身份）">{event.checked_by || '—'}</Field>
-          <Field label="审批人">{event.approved_by || '—'}</Field>
+          <Field label="审批人">{event.approved_by_name || event.approved_by || '—'}</Field>
           <Field label="批准时间">{fmt(event.approved_at)}</Field>
           <Field label="放行时间">{fmt(event.released_at)}</Field>
           <Field label="异常数">{typeof event.exception_count === 'number' ? event.exception_count : (event.exceptions?.length ?? 0)}</Field>
